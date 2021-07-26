@@ -7,7 +7,11 @@
 
 #include "MeshCO.hpp"
 
-#include "CTCD.h"
+// Etienne Vouga's CCD using a root finder in floating points
+#include <CTCD.h>
+#include <tight_inclusion/inclusion_ccd.hpp>
+#include "CCDUtils.hpp"
+
 #include "get_feasible_steps.hpp"
 #include "IglUtils.hpp"
 #include "BarrierFunctions.hpp"
@@ -388,7 +392,7 @@ void MeshCO<dim>::leftMultiplyConstraintJacobianTQP(
     else {
         //TODO: 2D collision
     }
-} // namespace IPC
+}
 
 template <int dim>
 void MeshCO<dim>::augmentIPHessian(const Mesh<dim>& mesh,
@@ -424,8 +428,8 @@ void MeshCO<dim>::augmentIPHessian(const Mesh<dim>& mesh,
                     IPHessian[cI] = ((coef * H_b) * g) * g.transpose() + (coef * g_b) * H;
                     IglUtils::makePD(IPHessian[cI]);
 
-                    rowIStart[cI][0] = (mesh.isFixedVert[MMCVIDI[0]] && projectDBC) ? -1 : (MMCVIDI[0] * dim);
-                    rowIStart[cI][1] = (mesh.isFixedVert[MMCVIDI[1]] && projectDBC) ? -1 : (MMCVIDI[1] * dim);
+                    rowIStart[cI][0] = mesh.isProjectDBCVertex(MMCVIDI[0], projectDBC) ? -1 : (MMCVIDI[0] * dim);
+                    rowIStart[cI][1] = mesh.isProjectDBCVertex(MMCVIDI[1], projectDBC) ? -1 : (MMCVIDI[1] * dim);
                     rowIStart[cI][2] = -1;
                     rowIStart[cI][3] = -1;
                 }
@@ -485,7 +489,7 @@ void MeshCO<dim>::augmentIPHessian(const Mesh<dim>& mesh,
                             IPHessian[cI] = ((coef * H_b) * g) * g.transpose() + (coef * g_b) * H;
                             IglUtils::makePD(IPHessian[cI]);
                         }
-                        rowIStart[cI][0] = (mesh.isFixedVert[v0I] && projectDBC) ? -1 : (v0I * dim);
+                        rowIStart[cI][0] = mesh.isProjectDBCVertex(v0I, projectDBC) ? -1 : (v0I * dim);
                         rowIStart[cI][1] = -1;
                         rowIStart[cI][2] = -1;
                         rowIStart[cI][3] = -1;
@@ -508,9 +512,9 @@ void MeshCO<dim>::augmentIPHessian(const Mesh<dim>& mesh,
                             IglUtils::makePD(IPHessian[cI]);
 
                             rowIStart[cI][0] = -1;
-                            rowIStart[cI][1] = (mesh.isFixedVert[-MMCVIDI[0] - 1] && projectDBC) ? -1 : ((-MMCVIDI[0] - 1) * dim);
-                            rowIStart[cI][2] = (mesh.isFixedVert[-MMCVIDI[1] - 1] && projectDBC) ? -1 : ((-MMCVIDI[1] - 1) * dim);
-                            rowIStart[cI][3] = (mesh.isFixedVert[-MMCVIDI[2] - 1] && projectDBC) ? -1 : ((-MMCVIDI[2] - 1) * dim);
+                            rowIStart[cI][1] = mesh.isProjectDBCVertex(-MMCVIDI[0] - 1, projectDBC) ? -1 : ((-MMCVIDI[0] - 1) * dim);
+                            rowIStart[cI][2] = mesh.isProjectDBCVertex(-MMCVIDI[1] - 1, projectDBC) ? -1 : ((-MMCVIDI[1] - 1) * dim);
+                            rowIStart[cI][3] = mesh.isProjectDBCVertex(-MMCVIDI[2] - 1, projectDBC) ? -1 : ((-MMCVIDI[2] - 1) * dim);
                         }
                         else {
                             // edge-point
@@ -531,8 +535,8 @@ void MeshCO<dim>::augmentIPHessian(const Mesh<dim>& mesh,
                             IPHessian[cI].template block<dim * 2, dim * 2>(dim, dim) = HessianBlock.template block<dim * 2, dim * 2>(dim, dim);
 
                             rowIStart[cI][0] = -1;
-                            rowIStart[cI][1] = (mesh.isFixedVert[-MMCVIDI[0] - 1] && projectDBC) ? -1 : ((-MMCVIDI[0] - 1) * dim);
-                            rowIStart[cI][2] = (mesh.isFixedVert[-MMCVIDI[1] - 1] && projectDBC) ? -1 : ((-MMCVIDI[1] - 1) * dim);
+                            rowIStart[cI][1] = mesh.isProjectDBCVertex(-MMCVIDI[0] - 1, projectDBC) ? -1 : ((-MMCVIDI[0] - 1) * dim);
+                            rowIStart[cI][2] = mesh.isProjectDBCVertex(-MMCVIDI[1] - 1, projectDBC) ? -1 : ((-MMCVIDI[1] - 1) * dim);
                             rowIStart[cI][3] = -1;
                         }
                     }
@@ -725,10 +729,237 @@ void MeshCO<dim>::largestFeasibleStepSize(const Mesh<dim>& mesh,
 }
 
 template <int dim>
+void MeshCO<dim>::largestFeasibleStepSize_TightInclusion(
+    const Mesh<dim>& mesh,
+    const SpatialHash<dim>& sh,
+    const Eigen::VectorXd& searchDir,
+    double tolerance,
+    const std::vector<std::pair<int, int>>& constraintSet,
+    double& stepSize)
+{
+#if (CFL_FOR_CCD != 0)
+    if (!constraintSet.size()) { return; }
+
+    tbb::mutex stepSizeLock;
+
+#ifdef USE_TBB
+    tbb::parallel_for(0, (int)constraintSet.size(), 1, [&](int cI) {
+#else
+    for (int cI = 0; cI < constraintSet.size(); ++cI) {
+#endif
+        if (constraintSet[cI].first < 0) {
+            if (constraintSet[cI].second < 0) {
+                // TP
+                int vI = -constraintSet[cI].second - 1;
+                const RowVector3i& sfVInd = mesh.SF.row(-constraintSet[cI].first - 1);
+
+                double d_sqrt; // d is squared distance
+                computePointTriD(Base::V.row(vI), mesh.V.row(sfVInd[0]),
+                    mesh.V.row(sfVInd[1]), mesh.V.row(sfVInd[2]), d_sqrt);
+                d_sqrt = std::sqrt(d_sqrt);
+                if (d_sqrt == 0) {
+                    spdlog::error("Initial CCD distance is zero! Returning 0 stepSize.");
+                    tbb::mutex::scoped_lock lock(stepSizeLock);
+                    stepSize = 0;
+                    return;
+                }
+
+                double toi, output_tolerance;
+                bool has_collision = inclusion_ccd::vertexFaceCCD_double(
+                    Base::V.row(vI).transpose(),
+                    mesh.V.row(sfVInd[0]).transpose(),
+                    mesh.V.row(sfVInd[1]).transpose(),
+                    mesh.V.row(sfVInd[2]).transpose(),
+                    Base::V.row(vI).transpose(),
+                    mesh.V.row(sfVInd[0]).transpose() + searchDir.segment<dim>(sfVInd[0] * dim),
+                    mesh.V.row(sfVInd[1]).transpose() + searchDir.segment<dim>(sfVInd[1] * dim),
+                    mesh.V.row(sfVInd[2]).transpose() + searchDir.segment<dim>(sfVInd[2] * dim),
+                    /*err=*/tight_inclusion_vf_err,
+                    /*ms=*/std::min(TIGHT_INCLUSION_DIST_P * d_sqrt, TIGHT_INCLUSION_MIN_DIST),
+                    toi,
+                    tolerance,
+                    stepSize,
+                    /* max_itr=*/TIGHT_INCLUSION_MAX_ITER,
+                    output_tolerance,
+                    /*CCD_TYPE=*/TIGHT_INCLUSION_MAX_ITER);
+
+                if (has_collision && toi < 1e-6) {
+                    has_collision = inclusion_ccd::vertexFaceCCD_double(
+                        Base::V.row(vI).transpose(),
+                        mesh.V.row(sfVInd[0]).transpose(),
+                        mesh.V.row(sfVInd[1]).transpose(),
+                        mesh.V.row(sfVInd[2]).transpose(),
+                        Base::V.row(vI).transpose(),
+                        mesh.V.row(sfVInd[0]).transpose() + searchDir.segment<dim>(sfVInd[0] * dim),
+                        mesh.V.row(sfVInd[1]).transpose() + searchDir.segment<dim>(sfVInd[1] * dim),
+                        mesh.V.row(sfVInd[2]).transpose() + searchDir.segment<dim>(sfVInd[2] * dim),
+                        /*err=*/tight_inclusion_vf_err,
+                        /*ms=*/0,
+                        toi,
+                        tolerance,
+                        /*max_t=*/stepSize,
+                        /* max_itr=*/-1,
+                        output_tolerance,
+                        /*CCD_TYPE=*/TIGHT_INCLUSION_MAX_ITER);
+                    if (has_collision) {
+                        toi *= 0.8;
+                    }
+                }
+
+                if (has_collision) {
+                    tbb::mutex::scoped_lock lock(stepSizeLock);
+                    if (toi < stepSize) {
+                        stepSize = toi;
+                    }
+                }
+            }
+            else {
+                // PT
+                int vI = mesh.SVI[-constraintSet[cI].first - 1];
+                const RowVector3i& sfVInd = Base::F.row(constraintSet[cI].second);
+
+                double d_sqrt;
+                computePointTriD(mesh.V.row(vI), Base::V.row(sfVInd[0]),
+                    Base::V.row(sfVInd[1]), Base::V.row(sfVInd[2]), d_sqrt);
+                d_sqrt = std::sqrt(d_sqrt);
+                if (d_sqrt == 0) {
+                    spdlog::error("Initial CCD distance is zero! Returning 0 stepSize.");
+                    tbb::mutex::scoped_lock lock(stepSizeLock);
+                    stepSize = 0;
+                    return;
+                }
+
+                double toi, output_tolerance;
+                bool has_collision = inclusion_ccd::vertexFaceCCD_double(
+                    mesh.V.row(vI).transpose(),
+                    Base::V.row(sfVInd[0]).transpose(),
+                    Base::V.row(sfVInd[1]).transpose(),
+                    Base::V.row(sfVInd[2]).transpose(),
+                    mesh.V.row(vI).transpose() + searchDir.segment<dim>(vI * dim),
+                    Base::V.row(sfVInd[0]).transpose(),
+                    Base::V.row(sfVInd[1]).transpose(),
+                    Base::V.row(sfVInd[2]).transpose(),
+                    /*err=*/tight_inclusion_vf_err,
+                    /*ms=*/std::min(TIGHT_INCLUSION_DIST_P * d_sqrt, TIGHT_INCLUSION_MIN_DIST),
+                    toi,
+                    tolerance,
+                    /*max_t=*/stepSize,
+                    /* max_itr=*/TIGHT_INCLUSION_MAX_ITER,
+                    output_tolerance,
+                    /*CCD_TYPE=*/TIGHT_INCLUSION_MAX_ITER);
+
+                if (has_collision && toi < 1e-6) {
+                    has_collision = inclusion_ccd::vertexFaceCCD_double(
+                        mesh.V.row(vI).transpose(),
+                        Base::V.row(sfVInd[0]).transpose(),
+                        Base::V.row(sfVInd[1]).transpose(),
+                        Base::V.row(sfVInd[2]).transpose(),
+                        mesh.V.row(vI).transpose() + searchDir.segment<dim>(vI * dim),
+                        Base::V.row(sfVInd[0]).transpose(),
+                        Base::V.row(sfVInd[1]).transpose(),
+                        Base::V.row(sfVInd[2]).transpose(),
+                        /*err=*/tight_inclusion_vf_err,
+                        /*ms=*/0,
+                        toi,
+                        tolerance,
+                        /*max_t=*/stepSize,
+                        /* max_itr=*/-1,
+                        output_tolerance,
+                        /*CCD_TYPE=*/TIGHT_INCLUSION_MAX_ITER);
+                    if (has_collision) {
+                        toi *= 0.8;
+                    }
+                }
+
+                if (has_collision) {
+                    tbb::mutex::scoped_lock lock(stepSizeLock);
+                    if (toi < stepSize) {
+                        stepSize = toi;
+                    }
+                }
+            }
+        }
+        else {
+            // EE
+            const auto& meshEI = mesh.SFEdges[constraintSet[cI].first];
+            const auto& meshEJ = edges[constraintSet[cI].second];
+
+            double d_sqrt;
+            computeEdgeEdgeD(mesh.V.row(meshEI.first), mesh.V.row(meshEI.second),
+                Base::V.row(meshEJ.first), Base::V.row(meshEJ.second), d_sqrt);
+            d_sqrt = std::sqrt(d_sqrt);
+            if (d_sqrt == 0) {
+                spdlog::error("Initial CCD distance is zero! Returning 0 stepSize.");
+                tbb::mutex::scoped_lock lock(stepSizeLock);
+                stepSize = 0;
+                return;
+            }
+
+            double toi, output_tolerance;
+            bool has_collision = inclusion_ccd::vertexFaceCCD_double(
+                mesh.V.row(meshEI.first).transpose(),
+                mesh.V.row(meshEI.second).transpose(),
+                Base::V.row(meshEJ.first).transpose(),
+                Base::V.row(meshEJ.second).transpose(),
+                mesh.V.row(meshEI.first).transpose() + searchDir.segment<dim>(meshEI.first * dim),
+                mesh.V.row(meshEI.second).transpose() + searchDir.segment<dim>(meshEI.second * dim),
+                Base::V.row(meshEJ.first).transpose(),
+                Base::V.row(meshEJ.second).transpose(),
+                /*err=*/tight_inclusion_ee_err,
+                /*ms=*/std::min(TIGHT_INCLUSION_DIST_P * d_sqrt, TIGHT_INCLUSION_MIN_DIST),
+                toi,
+                tolerance,
+                /*max_t=*/stepSize,
+                /* max_itr=*/TIGHT_INCLUSION_MAX_ITER,
+                output_tolerance,
+                /*CCD_TYPE=*/TIGHT_INCLUSION_MAX_ITER);
+
+            if (has_collision && toi < 1e-6) {
+                double output_tolerance;
+                bool has_collision = inclusion_ccd::vertexFaceCCD_double(
+                    mesh.V.row(meshEI.first).transpose(),
+                    mesh.V.row(meshEI.second).transpose(),
+                    Base::V.row(meshEJ.first).transpose(),
+                    Base::V.row(meshEJ.second).transpose(),
+                    mesh.V.row(meshEI.first).transpose() + searchDir.segment<dim>(meshEI.first * dim),
+                    mesh.V.row(meshEI.second).transpose() + searchDir.segment<dim>(meshEI.second * dim),
+                    Base::V.row(meshEJ.first).transpose(),
+                    Base::V.row(meshEJ.second).transpose(),
+                    /*err=*/tight_inclusion_ee_err,
+                    /*ms=*/0,
+                    toi,
+                    tolerance,
+                    /*max_t=*/stepSize,
+                    /* max_itr=*/-1,
+                    output_tolerance,
+                    /*CCD_TYPE=*/TIGHT_INCLUSION_MAX_ITER);
+
+                if (has_collision) {
+                    toi *= 0.8;
+                }
+            }
+
+            if (has_collision) {
+                tbb::mutex::scoped_lock lock(stepSizeLock);
+                if (toi < stepSize) {
+                    stepSize = toi;
+                }
+            }
+        }
+    }
+#ifdef USE_TBB
+    );
+#endif
+#else
+    largestFeasibleStepSize_CCD(mesh, sh, searchDir, tolerance, stepSize);
+#endif
+}
+
+template <int dim>
 void MeshCO<dim>::largestFeasibleStepSize_exact(const Mesh<dim>& mesh,
     const SpatialHash<dim>& sh,
     const Eigen::VectorXd& searchDir,
-    const ExactCCD::Method method,
+    const ccd::CCDMethod ccdMethod,
     const std::vector<std::pair<int, int>>& constraintSet,
     double& stepSize)
 {
@@ -748,7 +979,7 @@ void MeshCO<dim>::largestFeasibleStepSize_exact(const Mesh<dim>& mesh,
                         int vI = -constraintSet[cI].second - 1;
                         const RowVector3i& sfVInd = mesh.SF.row(-constraintSet[cI].first - 1);
 
-                        while (ExactCCD::vertexFaceCCD(
+                        while (ccd::vertexFaceCCD(
                             Base::V.row(vI).transpose(),
                             mesh.V.row(sfVInd[0]).transpose(),
                             mesh.V.row(sfVInd[1]).transpose(),
@@ -757,7 +988,7 @@ void MeshCO<dim>::largestFeasibleStepSize_exact(const Mesh<dim>& mesh,
                             mesh.V.row(sfVInd[0]).transpose() + largestAlphasAS[cI] * searchDir.segment<dim>(sfVInd[0] * dim),
                             mesh.V.row(sfVInd[1]).transpose() + largestAlphasAS[cI] * searchDir.segment<dim>(sfVInd[1] * dim),
                             mesh.V.row(sfVInd[2]).transpose() + largestAlphasAS[cI] * searchDir.segment<dim>(sfVInd[2] * dim),
-                            method)) {
+                            ccdMethod)) {
                             largestAlphasAS[cI] /= 2.0;
                         }
                     }
@@ -766,7 +997,7 @@ void MeshCO<dim>::largestFeasibleStepSize_exact(const Mesh<dim>& mesh,
                         int vI = mesh.SVI[-constraintSet[cI].first - 1];
                         const RowVector3i& sfVInd = Base::F.row(constraintSet[cI].second);
 
-                        while (ExactCCD::vertexFaceCCD(
+                        while (ccd::vertexFaceCCD(
                             mesh.V.row(vI).transpose(),
                             Base::V.row(sfVInd[0]).transpose(),
                             Base::V.row(sfVInd[1]).transpose(),
@@ -775,7 +1006,7 @@ void MeshCO<dim>::largestFeasibleStepSize_exact(const Mesh<dim>& mesh,
                             Base::V.row(sfVInd[0]).transpose(),
                             Base::V.row(sfVInd[1]).transpose(),
                             Base::V.row(sfVInd[2]).transpose(),
-                            method)) {
+                            ccdMethod)) {
                             largestAlphasAS[cI] /= 2.0;
                         }
                     }
@@ -785,7 +1016,7 @@ void MeshCO<dim>::largestFeasibleStepSize_exact(const Mesh<dim>& mesh,
                     const auto& meshEI = mesh.SFEdges[constraintSet[cI].first];
                     const auto& meshEJ = edges[constraintSet[cI].second];
 
-                    while (ExactCCD::edgeEdgeCCD(
+                    while (ccd::edgeEdgeCCD(
                         mesh.V.row(meshEI.first).transpose(),
                         mesh.V.row(meshEI.second).transpose(),
                         Base::V.row(meshEJ.first).transpose(),
@@ -794,7 +1025,7 @@ void MeshCO<dim>::largestFeasibleStepSize_exact(const Mesh<dim>& mesh,
                         mesh.V.row(meshEI.second).transpose() + largestAlphasAS[cI] * searchDir.segment<dim>(meshEI.second * dim),
                         Base::V.row(meshEJ.first).transpose(),
                         Base::V.row(meshEJ.second).transpose(),
-                        method)) {
+                        ccdMethod)) {
                         largestAlphasAS[cI] /= 2.0;
                     }
                 }
@@ -807,7 +1038,7 @@ void MeshCO<dim>::largestFeasibleStepSize_exact(const Mesh<dim>& mesh,
     return;
 #endif
 
-    largestFeasibleStepSize_CCD_exact(mesh, sh, searchDir, method, stepSize);
+    largestFeasibleStepSize_CCD_exact(mesh, sh, searchDir, ccdMethod, stepSize);
 }
 
 template <int dim>
@@ -1125,9 +1356,272 @@ void MeshCO<dim>::largestFeasibleStepSize_CCD(const Mesh<dim>& mesh,
 }
 
 template <int dim>
+void MeshCO<dim>::largestFeasibleStepSize_CCD_TightInclusion(
+    const Mesh<dim>& mesh,
+    const SpatialHash<dim>& sh,
+    const Eigen::VectorXd& searchDir,
+    double tolerance, double& stepSize)
+{
+    tbb::mutex stepSizeLock;
+
+    // point-triangle
+#ifdef USE_TBB
+    tbb::parallel_for(0, (int)Base::F.rows(), 1, [&](int sfI) {
+#else
+    for (int sfI = 0; sfI < Base::F.rows(); ++sfI) {
+#endif
+        const RowVector3i& sfVInd = Base::F.row(sfI);
+#ifdef USE_SH_LFSS
+        std::unordered_set<int> pointInds; //NOTE: different constraint order will result in numerically different results
+        sh.queryTriangleForPoints(Base::V.row(sfVInd[0]), Base::V.row(sfVInd[1]), Base::V.row(sfVInd[2]),
+            0.0, pointInds);
+        for (const auto& svI : pointInds) {
+#else
+        for (int svI = 0; svI < mesh.SVI.size(); ++svI) {
+#endif
+            int vI = mesh.SVI[svI];
+
+            double d_sqrt;
+            computePointTriD(mesh.V.row(vI), Base::V.row(sfVInd[0]),
+                Base::V.row(sfVInd[1]), Base::V.row(sfVInd[2]), d_sqrt);
+            d_sqrt = std::sqrt(d_sqrt);
+            if (d_sqrt == 0) {
+                spdlog::error("Initial CCD distance is zero! Returning 0 stepSize.");
+                tbb::mutex::scoped_lock lock(stepSizeLock);
+                stepSize = 0;
+                return;
+            }
+
+            double toi, output_tolerance;
+            bool has_collision = inclusion_ccd::vertexFaceCCD_double(
+                mesh.V.row(vI).transpose(),
+                Base::V.row(sfVInd[0]).transpose(),
+                Base::V.row(sfVInd[1]).transpose(),
+                Base::V.row(sfVInd[2]).transpose(),
+                mesh.V.row(vI).transpose() + searchDir.template segment<dim>(vI * dim),
+                Base::V.row(sfVInd[0]).transpose(),
+                Base::V.row(sfVInd[1]).transpose(),
+                Base::V.row(sfVInd[2]).transpose(),
+                /*err=*/tight_inclusion_vf_err,
+                /*ms=*/std::min(TIGHT_INCLUSION_DIST_P * d_sqrt, TIGHT_INCLUSION_MIN_DIST),
+                toi,
+                tolerance,
+                /*max_t=*/stepSize,
+                /* max_itr=*/TIGHT_INCLUSION_MAX_ITER,
+                output_tolerance,
+                /*CCD_TYPE=*/TIGHT_INCLUSION_MAX_ITER);
+
+            if (has_collision && toi < 1e-6) {
+                has_collision = inclusion_ccd::vertexFaceCCD_double(
+                    mesh.V.row(vI).transpose(),
+                    Base::V.row(sfVInd[0]).transpose(),
+                    Base::V.row(sfVInd[1]).transpose(),
+                    Base::V.row(sfVInd[2]).transpose(),
+                    mesh.V.row(vI).transpose() + searchDir.template segment<dim>(vI * dim),
+                    Base::V.row(sfVInd[0]).transpose(),
+                    Base::V.row(sfVInd[1]).transpose(),
+                    Base::V.row(sfVInd[2]).transpose(),
+                    /*err=*/tight_inclusion_vf_err,
+                    /*ms=*/0,
+                    toi,
+                    tolerance,
+                    /*max_t=*/stepSize,
+                    /* max_itr=*/-1,
+                    output_tolerance,
+                    /*CCD_TYPE=*/TIGHT_INCLUSION_MAX_ITER);
+                if (has_collision) {
+                    toi *= 0.8;
+                }
+            }
+
+            if (has_collision) {
+                tbb::mutex::scoped_lock lock(stepSizeLock);
+                if (toi < stepSize) {
+                    stepSize = toi;
+                }
+            }
+        }
+    }
+#ifdef USE_TBB
+    );
+#endif
+
+// triangle-point
+#ifdef USE_TBB
+    tbb::parallel_for(0, (int)Base::V.rows(), 1, [&](int vI) {
+#else
+    for (int vI = 0; vI < Base::V.rows(); ++vI) {
+#endif
+#ifdef USE_SH_LFSS
+        std::unordered_set<int> svInds, edgeInds, triInds; //NOTE: different constraint order will result in numerically different results
+        sh.queryPointForPrimitives(Base::V.row(vI), Eigen::Matrix<double, 1, dim>::Zero(),
+            svInds, edgeInds, triInds);
+
+        // triangle-point
+        for (const auto& sfI : triInds) {
+#else
+        for (int sfI = 0; sfI < mesh.SF.rows(); ++sfI) {
+#endif
+            const RowVector3i& sfVInd = mesh.SF.row(sfI);
+
+            double d_sqrt;
+            computePointTriD(
+                Base::V.row(vI),
+                mesh.V.row(sfVInd[0]),
+                mesh.V.row(sfVInd[1]),
+                mesh.V.row(sfVInd[2]),
+                d_sqrt);
+            d_sqrt = std::sqrt(d_sqrt);
+            if (d_sqrt == 0) {
+                spdlog::error("Initial CCD distance is zero! Returning 0 stepSize.");
+                tbb::mutex::scoped_lock lock(stepSizeLock);
+                stepSize = 0;
+                return;
+            }
+
+            double toi, output_tolerance;
+            bool has_collision = inclusion_ccd::vertexFaceCCD_double(
+                Base::V.row(vI).transpose(),
+                mesh.V.row(sfVInd[0]).transpose(),
+                mesh.V.row(sfVInd[1]).transpose(),
+                mesh.V.row(sfVInd[2]).transpose(),
+                Base::V.row(vI).transpose(),
+                mesh.V.row(sfVInd[0]).transpose() + searchDir.template segment<dim>(sfVInd[0] * dim),
+                mesh.V.row(sfVInd[1]).transpose() + searchDir.template segment<dim>(sfVInd[1] * dim),
+                mesh.V.row(sfVInd[2]).transpose() + searchDir.template segment<dim>(sfVInd[2] * dim),
+                /*err=*/tight_inclusion_vf_err,
+                /*ms=*/std::min(TIGHT_INCLUSION_DIST_P * d_sqrt, TIGHT_INCLUSION_MIN_DIST),
+                toi,
+                tolerance,
+                /*max_t=*/stepSize,
+                /* max_itr=*/TIGHT_INCLUSION_MAX_ITER,
+                output_tolerance,
+                /*CCD_TYPE=*/TIGHT_INCLUSION_MAX_ITER);
+
+            if (has_collision && toi < 1e-6) {
+                has_collision = inclusion_ccd::vertexFaceCCD_double(
+                    Base::V.row(vI).transpose(),
+                    mesh.V.row(sfVInd[0]).transpose(),
+                    mesh.V.row(sfVInd[1]).transpose(),
+                    mesh.V.row(sfVInd[2]).transpose(),
+                    Base::V.row(vI).transpose(),
+                    mesh.V.row(sfVInd[0]).transpose() + searchDir.template segment<dim>(sfVInd[0] * dim),
+                    mesh.V.row(sfVInd[1]).transpose() + searchDir.template segment<dim>(sfVInd[1] * dim),
+                    mesh.V.row(sfVInd[2]).transpose() + searchDir.template segment<dim>(sfVInd[2] * dim),
+                    /*err=*/tight_inclusion_vf_err,
+                    /*ms=*/0,
+                    toi,
+                    tolerance,
+                    /*max_t=*/stepSize,
+                    /* max_itr=*/-1,
+                    output_tolerance,
+                    /*CCD_TYPE=*/TIGHT_INCLUSION_MAX_ITER);
+                if (has_collision) {
+                    toi *= 0.8;
+                }
+            }
+
+            if (has_collision) {
+                tbb::mutex::scoped_lock lock(stepSizeLock);
+                if (toi < stepSize) {
+                    stepSize = toi;
+                }
+            }
+        }
+    }
+#ifdef USE_TBB
+    );
+#endif
+
+// edge-edge
+#ifdef USE_TBB
+    tbb::parallel_for(0, (int)edges.size(), 1, [&](int eJ) {
+#else
+    for (int eJ = 0; eJ < edges.size(); ++eJ) {
+#endif
+        const auto& meshEJ = edges[eJ];
+#ifdef USE_SH_LFSS
+        std::vector<int> svInds, edgeInds; //NOTE: different constraint order will result in numerically different results
+        sh.queryEdgeForPE(Base::V.row(meshEJ.first), Base::V.row(meshEJ.second),
+            svInds, edgeInds);
+
+        // edge-edge
+        for (const auto& eI : edgeInds) {
+            const auto& meshEI = mesh.SFEdges[eI];
+#else
+        for (const auto& meshEI : mesh.SFEdges) {
+#endif
+
+            double d_sqrt;
+            computeEdgeEdgeD(mesh.V.row(meshEI.first), mesh.V.row(meshEI.second),
+                Base::V.row(meshEJ.first), Base::V.row(meshEJ.second), d_sqrt);
+            d_sqrt = std::sqrt(d_sqrt);
+            if (d_sqrt == 0) {
+                spdlog::error("Initial CCD distance is zero! Returning 0 stepSize.");
+                tbb::mutex::scoped_lock lock(stepSizeLock);
+                stepSize = 0;
+                return;
+            }
+
+            double toi, output_tolerance;
+            bool has_collision = inclusion_ccd::vertexFaceCCD_double(
+                mesh.V.row(meshEI.first).transpose(),
+                mesh.V.row(meshEI.second).transpose(),
+                Base::V.row(meshEJ.first).transpose(),
+                Base::V.row(meshEJ.second).transpose(),
+                mesh.V.row(meshEI.first).transpose() + searchDir.template segment<dim>(meshEI.first * dim),
+                mesh.V.row(meshEI.second).transpose() + searchDir.template segment<dim>(meshEI.second * dim),
+                Base::V.row(meshEJ.first).transpose(),
+                Base::V.row(meshEJ.second).transpose(),
+                /*err=*/tight_inclusion_ee_err,
+                /*ms=*/std::min(TIGHT_INCLUSION_DIST_P * d_sqrt, TIGHT_INCLUSION_MIN_DIST),
+                toi,
+                tolerance,
+                /*max_t=*/stepSize,
+                /* max_itr=*/TIGHT_INCLUSION_MAX_ITER,
+                output_tolerance,
+                /*CCD_TYPE=*/TIGHT_INCLUSION_MAX_ITER);
+
+            if (has_collision && toi < 1e-6) {
+                has_collision = inclusion_ccd::vertexFaceCCD_double(
+                    mesh.V.row(meshEI.first).transpose(),
+                    mesh.V.row(meshEI.second).transpose(),
+                    Base::V.row(meshEJ.first).transpose(),
+                    Base::V.row(meshEJ.second).transpose(),
+                    mesh.V.row(meshEI.first).transpose() + searchDir.template segment<dim>(meshEI.first * dim),
+                    mesh.V.row(meshEI.second).transpose() + searchDir.template segment<dim>(meshEI.second * dim),
+                    Base::V.row(meshEJ.first).transpose(),
+                    Base::V.row(meshEJ.second).transpose(),
+                    /*err=*/tight_inclusion_ee_err,
+                    /*ms=*/0,
+                    toi,
+                    tolerance,
+                    /*max_t=*/stepSize,
+                    /* max_itr=*/-1,
+                    output_tolerance,
+                    /*CCD_TYPE=*/TIGHT_INCLUSION_MAX_ITER);
+                if (has_collision) {
+                    toi *= 0.8;
+                }
+            }
+
+            if (has_collision) {
+                tbb::mutex::scoped_lock lock(stepSizeLock);
+                if (toi < stepSize) {
+                    stepSize = toi;
+                }
+            }
+        }
+    }
+#ifdef USE_TBB
+    );
+#endif
+}
+
+template <int dim>
 void MeshCO<dim>::largestFeasibleStepSize_CCD_exact(const Mesh<dim>& mesh,
     const SpatialHash<dim>& sh, const Eigen::VectorXd& searchDir,
-    const ExactCCD::Method method, double& stepSize)
+    const ccd::CCDMethod ccdMethod, double& stepSize)
 {
     // point-triangle
     Eigen::VectorXd largestAlphaPT(Base::F.rows());
@@ -1150,7 +1644,7 @@ void MeshCO<dim>::largestFeasibleStepSize_CCD_exact(const Mesh<dim>& mesh,
             {
                 int vI = mesh.SVI[svI];
 
-                while (ExactCCD::vertexFaceCCD(
+                while (ccd::vertexFaceCCD(
                     mesh.V.row(vI).transpose(),
                     Base::V.row(sfVInd[0]).transpose(),
                     Base::V.row(sfVInd[1]).transpose(),
@@ -1159,7 +1653,7 @@ void MeshCO<dim>::largestFeasibleStepSize_CCD_exact(const Mesh<dim>& mesh,
                     Base::V.row(sfVInd[0]).transpose(),
                     Base::V.row(sfVInd[1]).transpose(),
                     Base::V.row(sfVInd[2]).transpose(),
-                    method)) {
+                    ccdMethod)) {
                     largestAlphaPT[sfI] /= 2.0;
                 }
             }
@@ -1190,7 +1684,7 @@ void MeshCO<dim>::largestFeasibleStepSize_CCD_exact(const Mesh<dim>& mesh,
             {
                 const RowVector3i& sfVInd = mesh.SF.row(sfI);
 
-                while (ExactCCD::vertexFaceCCD(
+                while (ccd::vertexFaceCCD(
                     Base::V.row(vI).transpose(),
                     mesh.V.row(sfVInd[0]).transpose(),
                     mesh.V.row(sfVInd[1]).transpose(),
@@ -1199,7 +1693,7 @@ void MeshCO<dim>::largestFeasibleStepSize_CCD_exact(const Mesh<dim>& mesh,
                     mesh.V.row(sfVInd[0]).transpose() + largestAlphaTP[vI] * searchDir.template segment<dim>(sfVInd[0] * dim),
                     mesh.V.row(sfVInd[1]).transpose() + largestAlphaTP[vI] * searchDir.template segment<dim>(sfVInd[1] * dim),
                     mesh.V.row(sfVInd[2]).transpose() + largestAlphaTP[vI] * searchDir.template segment<dim>(sfVInd[2] * dim),
-                    method)) {
+                    ccdMethod)) {
                     largestAlphaTP[vI] /= 2.0;
                 }
             }
@@ -1230,7 +1724,7 @@ void MeshCO<dim>::largestFeasibleStepSize_CCD_exact(const Mesh<dim>& mesh,
 #else
         for (const auto& meshEI : mesh.SFEdges) {
 #endif
-                while (ExactCCD::edgeEdgeCCD(
+                while (ccd::edgeEdgeCCD(
                     mesh.V.row(meshEI.first).transpose(),
                     mesh.V.row(meshEI.second).transpose(),
                     Base::V.row(meshEJ.first).transpose(),
@@ -1239,7 +1733,7 @@ void MeshCO<dim>::largestFeasibleStepSize_CCD_exact(const Mesh<dim>& mesh,
                     mesh.V.row(meshEI.second).transpose() + largestAlphaEE[eJ] * searchDir.template segment<dim>(meshEI.second * dim),
                     Base::V.row(meshEJ.first).transpose(),
                     Base::V.row(meshEJ.second).transpose(),
-                    method)) {
+                    ccdMethod)) {
                     largestAlphaEE[eJ] /= 2.0;
                 }
             }
@@ -1811,8 +2305,8 @@ void MeshCO<dim>::augmentParaEEHessian(const Mesh<dim>& mesh,
                     g_EE(mesh.V.row(MMCVIDI[0]), mesh.V.row(MMCVIDI[1]), Base::V.row(MMCVIDI[2]), Base::V.row(MMCVIDI[3]), grad_d);
                     H_EE(mesh.V.row(MMCVIDI[0]), mesh.V.row(MMCVIDI[1]), Base::V.row(MMCVIDI[2]), Base::V.row(MMCVIDI[3]), H_d);
 
-                    rowIStart[cI][0] = (mesh.isFixedVert[MMCVIDI[0]] && projectDBC) ? -1 : (MMCVIDI[0] * dim);
-                    rowIStart[cI][1] = (mesh.isFixedVert[MMCVIDI[1]] && projectDBC) ? -1 : (MMCVIDI[1] * dim);
+                    rowIStart[cI][0] = mesh.isProjectDBCVertex(MMCVIDI[0], projectDBC) ? -1 : (MMCVIDI[0] * dim);
+                    rowIStart[cI][1] = mesh.isProjectDBCVertex(MMCVIDI[1], projectDBC) ? -1 : (MMCVIDI[1] * dim);
                     rowIStart[cI][2] = -1;
                     rowIStart[cI][3] = -1;
                 }
@@ -1830,8 +2324,8 @@ void MeshCO<dim>::augmentParaEEHessian(const Mesh<dim>& mesh,
                     compute_e_g(mesh.V.row(eI.first), mesh.V.row(eI.second), Base::V.row(eJ.first), Base::V.row(eJ.second), eps_x, e_g);
                     compute_e_H(mesh.V.row(eI.first), mesh.V.row(eI.second), Base::V.row(eJ.first), Base::V.row(eJ.second), eps_x, e_H);
 
-                    rowIStart[cI][0] = (mesh.isFixedVert[eI.first] && projectDBC) ? -1 : (eI.first * dim);
-                    rowIStart[cI][1] = (mesh.isFixedVert[eI.second] && projectDBC) ? -1 : (eI.second * dim);
+                    rowIStart[cI][0] = mesh.isProjectDBCVertex(eI.first, projectDBC) ? -1 : (eI.first * dim);
+                    rowIStart[cI][1] = mesh.isProjectDBCVertex(eI.second, projectDBC) ? -1 : (eI.second * dim);
                     rowIStart[cI][2] = -1;
                     rowIStart[cI][3] = -1;
 
@@ -1940,10 +2434,10 @@ void MeshCO<dim>::augmentParaEEHessian(const Mesh<dim>& mesh,
                     }
                 }
 
-                Eigen::Matrix<double, 12, 12> mu_gradb_gradeT;
-                mu_gradb_gradeT = ((coef * g_b) * grad_d) * e_g.transpose();
+                Eigen::Matrix<double, 12, 12> kappa_gradb_gradeT;
+                kappa_gradb_gradeT = ((coef * g_b) * grad_d) * e_g.transpose();
 
-                PEEHessian[cI] = mu_gradb_gradeT + mu_gradb_gradeT.transpose() + (coef * b) * e_H + ((coef * e * H_b) * grad_d) * grad_d.transpose() + (coef * e * g_b) * H_d;
+                PEEHessian[cI] = kappa_gradb_gradeT + kappa_gradb_gradeT.transpose() + (coef * b) * e_H + ((coef * e * H_b) * grad_d) * grad_d.transpose() + (coef * e * g_b) * H_d;
                 IglUtils::makePD(PEEHessian[cI]);
             }
 #ifdef USE_TBB
@@ -2267,7 +2761,9 @@ bool MeshCO<dim>::updateActiveSet_QP(
     const Eigen::VectorXd& searchDir, // Linear displacement of the mesh vertices
     const CollisionConstraintType constraintType, // Update method
     std::vector<MMCVID>& activeSet, // Constraint active set to update
-    const double eta) // Surface thickness
+    const ccd::CCDMethod ccdMethod,
+    const double eta, // Surface thickness
+    const double ccd_tol)
 {
     bool newConstraintsAdded = false;
     mmcvid_to_toi.clear();
@@ -2316,17 +2812,56 @@ bool MeshCO<dim>::updateActiveSet_QP(
             int vI = mesh.SVI[svI];
 
             double toi;
-            bool intersects = CTCD::vertexFaceCTCD(
-                mesh.V_prev.row(vI).transpose(),
-                Base::V.row(MCTriVInd[0]).transpose(),
-                Base::V.row(MCTriVInd[1]).transpose(),
-                Base::V.row(MCTriVInd[2]).transpose(),
-                mesh.V.row(vI).transpose() + searchDir.segment<dim>(vI * dim),
-                Base::V.row(MCTriVInd[0]).transpose(),
-                Base::V.row(MCTriVInd[1]).transpose(),
-                Base::V.row(MCTriVInd[2]).transpose(),
-                eta,
-                toi);
+            bool intersects;
+            switch (ccdMethod) {
+            case ccd::CCDMethod::FLOATING_POINT_ROOT_FINDER: {
+                intersects = CTCD::vertexFaceCTCD(
+                    mesh.V_prev.row(vI).transpose(),
+                    Base::V.row(MCTriVInd[0]).transpose(),
+                    Base::V.row(MCTriVInd[1]).transpose(),
+                    Base::V.row(MCTriVInd[2]).transpose(),
+                    mesh.V.row(vI).transpose() + searchDir.segment<dim>(vI * dim),
+                    Base::V.row(MCTriVInd[0]).transpose(),
+                    Base::V.row(MCTriVInd[1]).transpose(),
+                    Base::V.row(MCTriVInd[2]).transpose(),
+                    eta,
+                    toi);
+                break;
+            }
+            case ccd::CCDMethod::TIGHT_INCLUSION: {
+                double output_tolerance;
+                intersects = inclusion_ccd::vertexFaceCCD_double(
+                    mesh.V_prev.row(vI).transpose(),
+                    Base::V.row(MCTriVInd[0]).transpose(),
+                    Base::V.row(MCTriVInd[1]).transpose(),
+                    Base::V.row(MCTriVInd[2]).transpose(),
+                    mesh.V.row(vI).transpose() + searchDir.segment<dim>(vI * dim),
+                    Base::V.row(MCTriVInd[0]).transpose(),
+                    Base::V.row(MCTriVInd[1]).transpose(),
+                    Base::V.row(MCTriVInd[2]).transpose(),
+                    tight_inclusion_vf_err,
+                    eta,
+                    toi,
+                    /*tolerance=*/ccd_tol,
+                    /*max_t=*/1,
+                    /* max_itr=*/TIGHT_INCLUSION_MAX_ITER,
+                    output_tolerance,
+                    /*CCD_TYPE=*/TIGHT_INCLUSION_MAX_ITER);
+                break;
+            }
+            default:
+                intersects = vertexFaceToIBisection(
+                    mesh.V_prev.row(vI).transpose(),
+                    Base::V.row(MCTriVInd[0]).transpose(),
+                    Base::V.row(MCTriVInd[1]).transpose(),
+                    Base::V.row(MCTriVInd[2]).transpose(),
+                    mesh.V.row(vI).transpose() + searchDir.segment<dim>(vI * dim),
+                    Base::V.row(MCTriVInd[0]).transpose(),
+                    Base::V.row(MCTriVInd[1]).transpose(),
+                    Base::V.row(MCTriVInd[2]).transpose(),
+                    ccdMethod,
+                    toi);
+            }
 
             MMCVID mmcvid = MMCVID(-vI - 1, // mesh point
                 MCTriVInd[0], MCTriVInd[2], MCTriVInd[1]); // CO triangle
@@ -2359,17 +2894,55 @@ bool MeshCO<dim>::updateActiveSet_QP(
             const RowVector3i& sfVInd = mesh.SF.row(sfI);
 
             double toi;
-            bool intersects = CTCD::vertexFaceCTCD(
-                Base::V.row(vI).transpose(),
-                mesh.V_prev.row(sfVInd[0]).transpose(),
-                mesh.V_prev.row(sfVInd[1]).transpose(),
-                mesh.V_prev.row(sfVInd[2]).transpose(),
-                Base::V.row(vI).transpose(),
-                mesh.V.row(sfVInd[0]).transpose() + searchDir.segment<dim>(sfVInd[0] * dim),
-                mesh.V.row(sfVInd[1]).transpose() + searchDir.segment<dim>(sfVInd[1] * dim),
-                mesh.V.row(sfVInd[2]).transpose() + searchDir.segment<dim>(sfVInd[2] * dim),
-                eta,
-                toi);
+            bool intersects;
+            switch (ccdMethod) {
+            case ccd::CCDMethod::FLOATING_POINT_ROOT_FINDER:
+                intersects = CTCD::vertexFaceCTCD(
+                    Base::V.row(vI).transpose(),
+                    mesh.V_prev.row(sfVInd[0]).transpose(),
+                    mesh.V_prev.row(sfVInd[1]).transpose(),
+                    mesh.V_prev.row(sfVInd[2]).transpose(),
+                    Base::V.row(vI).transpose(),
+                    mesh.V.row(sfVInd[0]).transpose() + searchDir.segment<dim>(sfVInd[0] * dim),
+                    mesh.V.row(sfVInd[1]).transpose() + searchDir.segment<dim>(sfVInd[1] * dim),
+                    mesh.V.row(sfVInd[2]).transpose() + searchDir.segment<dim>(sfVInd[2] * dim),
+                    eta,
+                    toi);
+                break;
+            case ccd::CCDMethod::TIGHT_INCLUSION: {
+                double output_tolerance;
+                intersects = inclusion_ccd::vertexFaceCCD_double(
+                    Base::V.row(vI).transpose(),
+                    mesh.V_prev.row(sfVInd[0]).transpose(),
+                    mesh.V_prev.row(sfVInd[1]).transpose(),
+                    mesh.V_prev.row(sfVInd[2]).transpose(),
+                    Base::V.row(vI).transpose(),
+                    mesh.V.row(sfVInd[0]).transpose() + searchDir.segment<dim>(sfVInd[0] * dim),
+                    mesh.V.row(sfVInd[1]).transpose() + searchDir.segment<dim>(sfVInd[1] * dim),
+                    mesh.V.row(sfVInd[2]).transpose() + searchDir.segment<dim>(sfVInd[2] * dim),
+                    tight_inclusion_vf_err,
+                    eta,
+                    toi,
+                    /*tolerance=*/ccd_tol,
+                    /*max_t=*/1,
+                    /* max_itr=*/TIGHT_INCLUSION_MAX_ITER,
+                    output_tolerance,
+                    /*CCD_TYPE=*/TIGHT_INCLUSION_MAX_ITER);
+                break;
+            }
+            default:
+                intersects = vertexFaceToIBisection(
+                    Base::V.row(vI).transpose(),
+                    mesh.V_prev.row(sfVInd[0]).transpose(),
+                    mesh.V_prev.row(sfVInd[1]).transpose(),
+                    mesh.V_prev.row(sfVInd[2]).transpose(),
+                    Base::V.row(vI).transpose(),
+                    mesh.V.row(sfVInd[0]).transpose() + searchDir.segment<dim>(sfVInd[0] * dim),
+                    mesh.V.row(sfVInd[1]).transpose() + searchDir.segment<dim>(sfVInd[1] * dim),
+                    mesh.V.row(sfVInd[2]).transpose() + searchDir.segment<dim>(sfVInd[2] * dim),
+                    ccdMethod,
+                    toi);
+            }
 
             MMCVID mmcvid = MMCVID(
                 -sfVInd[0] - 1, -sfVInd[2] - 1, -sfVInd[1] - 1, // mesh triangle
@@ -2437,17 +3010,55 @@ bool MeshCO<dim>::updateActiveSet_QP(
             }
 
             double toi;
-            bool intersects = CTCD::edgeEdgeCTCD(
-                mesh.V_prev.row(mesh_edge.first).transpose(),
-                mesh.V_prev.row(mesh_edge.second).transpose(),
-                Base::V.row(co_edge.first).transpose(),
-                Base::V.row(co_edge.second).transpose(),
-                mesh.V.row(mesh_edge.first).transpose() + searchDir.segment<dim>(mesh_edge.first * dim),
-                mesh.V.row(mesh_edge.second).transpose() + searchDir.segment<dim>(mesh_edge.second * dim),
-                Base::V.row(co_edge.first).transpose(),
-                Base::V.row(co_edge.second).transpose(),
-                eta,
-                toi);
+            bool intersects;
+            switch (ccdMethod) {
+            case ccd::CCDMethod::FLOATING_POINT_ROOT_FINDER:
+                intersects = CTCD::edgeEdgeCTCD(
+                    mesh.V_prev.row(mesh_edge.first).transpose(),
+                    mesh.V_prev.row(mesh_edge.second).transpose(),
+                    Base::V.row(co_edge.first).transpose(),
+                    Base::V.row(co_edge.second).transpose(),
+                    mesh.V.row(mesh_edge.first).transpose() + searchDir.segment<dim>(mesh_edge.first * dim),
+                    mesh.V.row(mesh_edge.second).transpose() + searchDir.segment<dim>(mesh_edge.second * dim),
+                    Base::V.row(co_edge.first).transpose(),
+                    Base::V.row(co_edge.second).transpose(),
+                    eta,
+                    toi);
+                break;
+            case ccd::CCDMethod::TIGHT_INCLUSION: {
+                double output_tolerance;
+                intersects = inclusion_ccd::edgeEdgeCCD_double(
+                    mesh.V_prev.row(mesh_edge.first).transpose(),
+                    mesh.V_prev.row(mesh_edge.second).transpose(),
+                    Base::V.row(co_edge.first).transpose(),
+                    Base::V.row(co_edge.second).transpose(),
+                    mesh.V.row(mesh_edge.first).transpose() + searchDir.segment<dim>(mesh_edge.first * dim),
+                    mesh.V.row(mesh_edge.second).transpose() + searchDir.segment<dim>(mesh_edge.second * dim),
+                    Base::V.row(co_edge.first).transpose(),
+                    Base::V.row(co_edge.second).transpose(),
+                    tight_inclusion_ee_err,
+                    eta,
+                    toi,
+                    /*tolerance=*/ccd_tol,
+                    /*max_t=*/1,
+                    /* max_itr=*/TIGHT_INCLUSION_MAX_ITER,
+                    output_tolerance,
+                    /*CCD_TYPE=*/TIGHT_INCLUSION_MAX_ITER);
+                break;
+            }
+            default:
+                intersects = edgeEdgeToIBisection(
+                    mesh.V_prev.row(mesh_edge.first).transpose(),
+                    mesh.V_prev.row(mesh_edge.second).transpose(),
+                    Base::V.row(co_edge.first).transpose(),
+                    Base::V.row(co_edge.second).transpose(),
+                    mesh.V.row(mesh_edge.first).transpose() + searchDir.segment<dim>(mesh_edge.first * dim),
+                    mesh.V.row(mesh_edge.second).transpose() + searchDir.segment<dim>(mesh_edge.second * dim),
+                    Base::V.row(co_edge.first).transpose(),
+                    Base::V.row(co_edge.second).transpose(),
+                    ccdMethod,
+                    toi);
+            }
 
             if (intersects && constraintType == CollisionConstraintType::VERSCHOOR) {
                 Eigen::Matrix<double, dim, 1> mesh_v0_toi = (mesh.V.row(mesh_edge.first) - mesh.V_prev.row(mesh_edge.first)) * toi + mesh.V_prev.row(mesh_edge.first);
@@ -2478,14 +3089,14 @@ template <int dim>
 bool MeshCO<dim>::isIntersected(
     const Mesh<dim>& mesh,
     const Eigen::MatrixXd& V0,
-    const ExactCCD::Method method) const
+    const ccd::CCDMethod ccdMethod) const
 {
 #ifdef USE_EXACT_CCD
-    if (method == ExactCCD::Method::NONE) {
+    if (ccdMethod == ccd::CCDMethod::FLOATING_POINT_ROOT_FINDER) {
         return false;
     }
 
-//TODO: spatial hashing
+    //TODO: spatial hashing
 #ifdef USE_SH_INTERSECTED
     Eigen::MatrixXd searchDir = mesh.V - V0;
     searchDir = Map<VectorXd>(searchDir.data(), searchDir.size());
@@ -2509,7 +3120,7 @@ bool MeshCO<dim>::isIntersected(
         for (int svI = 0; svI < mesh.SVI.size(); ++svI) {
 #endif
             int vI = mesh.SVI[svI];
-            if (ExactCCD::vertexFaceCCD(
+            if (ccd::vertexFaceCCD(
                     V0.row(vI).transpose(),
                     this->V.row(MCTriVInd[0]).transpose(),
                     this->V.row(MCTriVInd[1]).transpose(),
@@ -2518,7 +3129,7 @@ bool MeshCO<dim>::isIntersected(
                     this->V.row(MCTriVInd[0]).transpose(),
                     this->V.row(MCTriVInd[1]).transpose(),
                     this->V.row(MCTriVInd[2]).transpose(),
-                    method)) {
+                    ccdMethod)) {
                 return true;
             }
         }
@@ -2527,7 +3138,7 @@ bool MeshCO<dim>::isIntersected(
     // triangle-point
     // Loop over mesh collision object vertices
     for (int vI = 0; vI < this->V.rows(); ++vI) {
-// Loop over FEM mesh surface faces
+        // Loop over FEM mesh surface faces
 #ifdef USE_SH_INTERSECTED
         std::unordered_set<int> triInds; //NOTE: different constraint order will result in numerically different results
         sh.queryPointForTriangles(Base::V.row(vI), /*radius=*/0, triInds);
@@ -2536,7 +3147,7 @@ bool MeshCO<dim>::isIntersected(
         for (int sfI = 0; sfI < mesh.SF.rows(); ++sfI) {
 #endif
             const RowVector3i& sfVInd = mesh.SF.row(sfI);
-            if (ExactCCD::vertexFaceCCD(
+            if (ccd::vertexFaceCCD(
                     this->V.row(vI).transpose(),
                     V0.row(sfVInd[0]).transpose(),
                     V0.row(sfVInd[1]).transpose(),
@@ -2545,7 +3156,7 @@ bool MeshCO<dim>::isIntersected(
                     mesh.V.row(sfVInd[0]).transpose(),
                     mesh.V.row(sfVInd[1]).transpose(),
                     mesh.V.row(sfVInd[2]).transpose(),
-                    method)) {
+                    ccdMethod)) {
                 return true;
             }
         }
@@ -2555,8 +3166,8 @@ bool MeshCO<dim>::isIntersected(
     // Loop over meshCO edges
     // Get the mesh CO edge as a pair of indiced into this->V
     for (const std::pair<int, int>& co_edge : edges) {
-// Loop over FEM mesh edges
-// Get the FEM mesh edge as a pair of indiced into mesh.V
+        // Loop over FEM mesh edges
+        // Get the FEM mesh edge as a pair of indiced into mesh.V
 #ifdef USE_SH_INTERSECTED
         std::vector<int> sEdgeInds;
         sh.queryEdgeForEdges(
@@ -2567,7 +3178,7 @@ bool MeshCO<dim>::isIntersected(
         for (int seI = 0; seI < mesh.SFEdges.size(); ++seI) {
 #endif
             const std::pair<int, int>& mesh_edge = mesh.SFEdges[seI];
-            if (ExactCCD::edgeEdgeCCD(
+            if (ccd::edgeEdgeCCD(
                     V0.row(mesh_edge.first).transpose(),
                     V0.row(mesh_edge.second).transpose(),
                     this->V.row(co_edge.first).transpose(),
@@ -2576,7 +3187,7 @@ bool MeshCO<dim>::isIntersected(
                     mesh.V.row(mesh_edge.second).transpose(),
                     this->V.row(co_edge.first).transpose(),
                     this->V.row(co_edge.second).transpose(),
-                    method)) {
+                    ccdMethod)) {
                 return true;
             }
         }

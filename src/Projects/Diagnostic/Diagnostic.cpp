@@ -35,12 +35,14 @@
 #endif
 
 // amgcl
+#ifdef USE_AMGCL
 #include <amgcl/make_solver.hpp>
 #include <amgcl/solver/bicgstab.hpp>
 #include <amgcl/amg.hpp>
 #include <amgcl/coarsening/smoothed_aggregation.hpp>
 #include <amgcl/relaxation/spai0.hpp>
 #include <amgcl/adapter/crs_tuple.hpp>
+#endif
 
 #include "Timer.hpp"
 
@@ -236,8 +238,8 @@ public:
                     std::vector<std::pair<Eigen::Vector3i, Eigen::Vector3d>>(),
                     std::vector<std::pair<Eigen::Vector3i, Eigen::Vector3d>>(),
                     std::vector<std::pair<Eigen::Vector3i, std::array<Eigen::Vector3d, 2>>>(),
-                    std::vector<std::pair<std::vector<int>, std::array<Eigen::Vector3d, 2>>>(),
-                    std::map<int, Eigen::Matrix<double, 1, DIM>>(),
+                    std::vector<DirichletBC>(),
+                    std::vector<NeumannBC>(),
                     std::vector<std::pair<int, std::string>>(),
                     1e5, 0.4, 1e3);
                 int numOfInv = 0, numOfBInv = 0;
@@ -336,6 +338,7 @@ public:
                 break;
             }
 
+#ifdef USE_AMGCL
             case 22: { // test AMGCL
                 std::vector<int> ptr, col;
                 std::vector<double> val, rhs;
@@ -366,6 +369,7 @@ public:
 
                 break;
             }
+#endif
 
             case 23: { // test linear solver
                 LinSysSolver<Eigen::VectorXi, Eigen::VectorXd>* linSysSolver;
@@ -442,10 +446,10 @@ public:
                 p3 << 1.53219607460276839930e-03, -2.16017817697321734202e-03, 3.07026181598997471855e-03;
 
                 double stepSize = 1;
-                while (ExactCCD::edgeEdgeCCD(
+                while (ccd::edgeEdgeCCD(
                     v0, v1, v2, v3,
                     v0 + stepSize * p0, v1 + stepSize * p1, v2 + stepSize * p2, v3 + stepSize * p3,
-                    ExactCCD::Method::ROOT_PARITY)) {
+                    ccd::CCDMethod::ROOT_PARITY)) {
                     stepSize /= 2.0;
                 }
 

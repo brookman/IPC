@@ -1,5 +1,5 @@
 //
-//  Triplet.h
+//  Triplet.hpp
 //  IPC
 //
 //  Created by Minchen Li on 9/30/18.
@@ -7,6 +7,8 @@
 
 #ifndef Triplet_h
 #define Triplet_h
+
+#include <cassert>
 
 #include <iostream>
 
@@ -29,6 +31,12 @@ public:
         key[2] = key2;
     }
 
+    int operator[](int i) const
+    {
+        assert(0 <= i && i <= 2);
+        return key[i];
+    }
+
     bool operator<(const Triplet& right) const
     {
         if (key[0] < right.key[0]) {
@@ -45,6 +53,11 @@ public:
             }
         }
         return false;
+    }
+
+    bool operator==(const Triplet& right) const
+    {
+        return key[0] == right[0] && key[1] == right[1] && key[2] == right[2];
     }
 };
 

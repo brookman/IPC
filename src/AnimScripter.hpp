@@ -120,10 +120,10 @@ protected:
     std::string meshSeqFolderPath;
     int meshI;
 
-    double curTime = 0;
-    double DBCTimeRange[2] = { 0, __DBL_MAX__ };
-    double NBCTimeRange[2] = { 0, __DBL_MAX__ };
-    std::set<int> fixedVertBK;
+    double stepStartTime = 0, stepEndTime = 0;
+    std::array<double, 2> DBCTimeRange = { 0.0, std::numeric_limits<double>::infinity() };
+    std::array<double, 2> NBCTimeRange = { 0.0, std::numeric_limits<double>::infinity() };
+    std::set<int> DBCVertexIdsBK;
 
 protected:
     static const std::vector<std::string> animScriptTypeStrs;
@@ -133,17 +133,17 @@ public:
 
 public:
     void initAnimScript(Mesh<dim>& mesh,
-        const std::vector<CollisionObject<dim>*>& ACO,
-        const std::vector<CollisionObject<dim>*>& MCO,
-        double DBCTimeRange[2],
-        double NBCTimeRange[2]);
+        const std::vector<std::shared_ptr<CollisionObject<dim>>>& ACO,
+        const std::vector<std::shared_ptr<CollisionObject<dim>>>& MCO,
+        const std::array<double, 2>& DBCTimeRange,
+        const std::array<double, 2>& NBCTimeRange);
     void initVelocity(const Mesh<dim>& mesh, const std::vector<double>& params,
         Eigen::VectorXd& velocity) const;
     int stepAnimScript(Mesh<dim>& mesh,
         const SpatialHash<dim>& sh,
-        std::vector<CollisionObject<dim>*>& ACO,
-        std::vector<CollisionObject<dim>*>& MCO,
-        const ExactCCD::Method method,
+        std::vector<std::shared_ptr<CollisionObject<dim>>>& ACO,
+        std::vector<std::shared_ptr<CollisionObject<dim>>>& MCO,
+        const ccd::CCDMethod method,
         double dt, double dHat, const std::vector<Energy<dim>*>& energyTerms,
         bool isSelfCollision, bool forceIntersectionLineSearch);
     double getCompletedStepSize(void) const;
@@ -157,6 +157,7 @@ public:
     double getCOCompletedStepSize(void) const;
 
     bool isNBCActive(void) const;
+    bool isNBCActive(const Mesh<dim>& mesh, int NBCi) const;
 
 public:
     void setAnimScriptType(AnimScriptType p_animScriptType);
@@ -165,6 +166,9 @@ public:
 public:
     static AnimScriptType getAnimScriptTypeByStr(const std::string& str);
     static std::string getStrByAnimScriptType(AnimScriptType animScriptType);
+
+protected:
+    void setDBCVertices(Mesh<dim>& mesh) const;
 };
 
 } // namespace IPC

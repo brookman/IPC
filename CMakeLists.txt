@@ -3,7 +3,32 @@ project(IPC)
 
 ################################################################################
 
+# Detects whether this is a top-level project
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    set(IPC_TOPLEVEL_PROJECT ON)
+else()
+    set(IPC_TOPLEVEL_PROJECT OFF)
+endif()
+
+# Project options
+option(IPC_WITH_OPENGL "Use libgil viewer for preview and output" ON)
+option(IPC_WITH_AMGCL "Enable AMGCL linear system solver (select with IPC_LINSYSSOLVER=\"AMGCL\")" ON)
+option(IPC_WITH_CHOLMOD "Enable CHOLMOD linear system solver (select with IPC_LINSYSSOLVER=\"CHOLMOD\")" ON)
+set(IPC_LINSYSSOLVER "CHOLMOD" CACHE STRING "Linear system solver to use (options: CHOLMOD, AMGCL, EIGEN)")
+set_property(CACHE IPC_LINSYSSOLVER PROPERTY STRINGS "CHOLMOD" "AMGCL" "EIGEN")
+## SQP and QP options
+option(IPC_WITH_GUROBI       "Enable Gurobi QP solver for SQP method"             OFF)
+option(IPC_WITH_OSQP_MKL     "Use MKL Pardiso linear solver in OSQP if available"  ON)
+option(IPC_EXIT_UPON_QP_FAIL "Exit if the QP/SQP intersects or blows-up"          OFF)
+## CCD options
+option(IPC_WITH_EXACT_CCD "Use exact CCD as a verification"                OFF)
+option(IPC_WITH_FPRP      "Use exact floating-point CCD as a verification" OFF)
+mark_as_advanced(IPC_WITH_FPRP)
+## Top level options
+option(IPC_WITH_TESTS "Build unit tests using Catch2" ${IPC_TOPLEVEL_PROJECT})
+
 # libigl
+# WARNING: LIBIGL_USE_STATIC_LIBRARY=ON does not work with C++ 17
 option(LIBIGL_USE_STATIC_LIBRARY     "Use libigl as static library" OFF)
 option(LIBIGL_WITH_ANTTWEAKBAR       "Use AntTweakBar"              OFF)
 option(LIBIGL_WITH_CGAL              "Use CGAL"                     OFF)
@@ -25,17 +50,6 @@ option(LIBIGL_QUIET_VIEWER           "Suppress viewer messages"     ON)
 option(LIBIGL_WITH_XML               "Use XML"                      OFF)
 option(LIBIGL_WITH_PREDICATES        "Use exact predicates"         ON)
 
-# project-options
-option(IPC_WITH_EXACT_CCD "Use exact CCD as a verification"                     ON)
-option(IPC_WITH_TESTS     "Build unit tests using Catch2"                       ON)
-option(IPC_WITH_GUROBI    "Enable Gurobi QP solver for SQP method"             OFF)
-option(IPC_WITH_OSQP_MKL  "Use MKL Pardiso linear solver in OSQP if available"  ON)
-option(IPC_WITH_OPENGL    "Use libgil viewer for preview and output"            ON)
-set(IPC_LINSYSSOLVER "CHOLMOD" CACHE STRING "Linear system solver to use (options: CHOLMOD, AMGCL, EIGEN)")
-set_property(CACHE IPC_LINSYSSOLVER PROPERTY STRINGS "CHOLMOD" "AMGCL" "EIGEN")
-option(IPC_EXIT_UPON_QP_FAIL  "Exit if the QP/SQP intersects or blows-up" OFF)
-
-
 if(NOT IPC_WITH_OPENGL)
   set(LIBIGL_WITH_VIEWER OFF CACHE BOOL "" FORCE)
   set(LIBIGL_WITH_OPENGL_GLFW_IMGUI OFF CACHE BOOL "" FORCE)
@@ -43,8 +57,6 @@ if(NOT IPC_WITH_OPENGL)
   set(LIBIGL_WITH_OPENGL OFF CACHE BOOL "" FORCE)
   set(LIBIGL_WITH_PNG OFF CACHE BOOL "" FORCE)
 endif()
-
-# debug-options
 
 ################################################################################
 
@@ -99,10 +111,6 @@ target_include_directories(${PROJECT_NAME}_dev PUBLIC
   "src/TimeStepper"
 )
 
-if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-  target_link_libraries(${PROJECT_NAME}_dev PUBLIC stdc++fs)
-endif()
-
 ################################################################################
 # Simulations Executable
 ################################################################################
@@ -114,26 +122,14 @@ target_link_libraries(${PROJECT_NAME}_bin PUBLIC ${PROJECT_NAME}_dev)
 target_link_libraries(${PROJECT_NAME}_bin PUBLIC CLI11::CLI11)
 
 ################################################################################
-# Etienne Vouga's CTCD Library
-################################################################################
-
-add_library(EVCTCD "src/CCD/EVCTCD/CTCD.cpp")
-target_include_directories(EVCTCD PUBLIC "src/CCD/EVCTCD/")
-# Link against Eigen in libigl
-target_link_libraries(EVCTCD PUBLIC igl::core)
-# Turn of floating point contraction for CCD robustness
-target_compile_options(EVCTCD PUBLIC "-ffp-contract=off")
-
-################################################################################
 # Required Libraries
 ################################################################################
 
-# EVCTCD
-target_link_libraries(${PROJECT_NAME}_dev PUBLIC EVCTCD)
-
 # SuiteSparse
-target_link_libraries(${PROJECT_NAME}_dev PUBLIC ${SUITESPARSE_LIBRARIES})
-target_include_directories(${PROJECT_NAME}_dev PUBLIC ${SUITESPARSE_INCLUDE_DIRS})
+if(IPC_WITH_CHOLMOD)
+  target_link_libraries(${PROJECT_NAME}_dev PUBLIC ${SUITESPARSE_LIBRARIES})
+  target_include_directories(${PROJECT_NAME}_dev PUBLIC ${SUITESPARSE_INCLUDE_DIRS})
+endif()
 
 # OSQP
 target_link_libraries(${PROJECT_NAME}_dev PUBLIC osqp::osqp)
@@ -145,28 +141,31 @@ if(IPC_WITH_OPENGL)
   target_compile_definitions(${PROJECT_NAME}_dev PUBLIC USE_OPENGL)
 endif()
 
-
 if(LIBIGL_WITH_PREDICATES)
   target_link_libraries(${PROJECT_NAME}_dev PUBLIC igl::predicates)
   target_compile_definitions(${PROJECT_NAME}_dev PUBLIC USE_PREDICATES)
 endif()
 
-target_link_libraries(${PROJECT_NAME}_dev PUBLIC RationalCCD)
+# CCD
+target_link_libraries(${PROJECT_NAME}_dev PUBLIC CCDWrapper)
+if(IPC_WITH_EXACT_CCD)
+  message(WARNING "The exact CCD methods RootParity and BSC miss some collisions! Please use TightInclusion instead.")
+  target_compile_definitions(${PROJECT_NAME}_dev PUBLIC USE_EXACT_CCD)
+endif()
+if(IPC_WITH_FPRP)
+  target_compile_definitions(${PROJECT_NAME}_dev PUBLIC USE_FPRP_CCD)
+endif()
 
 # tbb
 target_link_libraries(${PROJECT_NAME}_dev PUBLIC TBB::tbb)
-
-# exact-ccd
-if(IPC_WITH_EXACT_CCD)
-  target_link_libraries(${PROJECT_NAME}_dev PUBLIC exact-ccd::exact-ccd)
-  target_compile_definitions(${PROJECT_NAME}_dev PUBLIC USE_EXACT_CCD)
-endif()
 
 # Logger
 target_link_libraries(${PROJECT_NAME}_dev PUBLIC spdlog::spdlog)
 
 # AMGCL
-target_link_libraries(${PROJECT_NAME}_dev PUBLIC amgcl::amgcl)
+if(IPC_WITH_AMGCL)
+  target_link_libraries(${PROJECT_NAME}_dev PUBLIC amgcl::amgcl)
+endif()
 
 # target_link_libraries(${PROJECT_NAME}_dev PUBLIC pardiso600-GNU720-X86-64 gfortran)
 # find_package(Pardiso)
@@ -199,6 +198,12 @@ endif()
 
 # Extra warnings
 # target_link_libraries(${PROJECT_NAME}_dev PRIVATE warnings::all)
+
+# MshIO
+target_link_libraries(${PROJECT_NAME}_dev PUBLIC mshio::mshio)
+
+# Filesystem
+target_link_libraries(${PROJECT_NAME}_dev PUBLIC ghc::filesystem)
 
 ################################################################################
 # Sub-Projects
@@ -281,11 +286,27 @@ endif()
 
 # Set the selected linear system solver
 if(IPC_LINSYSSOLVER STREQUAL "CHOLMOD")
-  target_compile_definitions(${PROJECT_NAME}_dev PUBLIC LINSYSSOLVER_USE_CHOLMOD)
+  if(IPC_WITH_CHOLMOD)
+    target_compile_definitions(${PROJECT_NAME}_dev PUBLIC LINSYSSOLVER_USE_CHOLMOD)
+  else()
+    message(FATAL_ERROR "CHOLMOD selected as IPC_LINSYSSOLVER, but CHOLMOD is disabled (IPC_WITH_CHOLMOD=OFF)!")
+  endif()
 elseif(IPC_LINSYSSOLVER STREQUAL "AMGCL")
-  target_compile_definitions(${PROJECT_NAME}_dev PUBLIC LINSYSSOLVER_USE_AMGCL)
+  if(IPC_WITH_AMGCL)
+    target_compile_definitions(${PROJECT_NAME}_dev PUBLIC LINSYSSOLVER_USE_AMGCL)
+  else()
+    message(FATAL_ERROR "AMGCL selected as IPC_LINSYSSOLVER, but AMGCL is disabled (IPC_WITH_AMGCL=OFF)!")
+  endif()
 elseif(NOT (IPC_LINSYSSOLVER STREQUAL "EIGEN"))
   message(WARNING "Invalid linear system solver: ${IPC_LINSYSSOLVER}. Falling back to EIGEN.")
+endif()
+
+if(IPC_WITH_AMGCL)
+  target_compile_definitions(${PROJECT_NAME}_dev PUBLIC USE_AMGCL)
+endif()
+
+if(IPC_WITH_CHOLMOD)
+  target_compile_definitions(${PROJECT_NAME}_dev PUBLIC USE_CHOLMOD)
 endif()
 
 # Quiet the viewer

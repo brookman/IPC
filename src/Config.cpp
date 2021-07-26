@@ -14,14 +14,8 @@
 #include <fstream>
 #include <sstream>
 #include <ctime>
-#if __has_include(<filesystem>)
-#include <filesystem>
-namespace fs = std::filesystem;
-#else
-#include <experimental/filesystem>
-namespace fs = std::experimental::filesystem;
-#endif
 
+#include <ghc/fs_std.hpp> // filesystem
 #include <spdlog/spdlog.h>
 
 namespace IPC {
@@ -34,9 +28,6 @@ const std::vector<std::string> Config::timeIntegrationTypeStrs = {
 };
 const std::vector<std::string> Config::constraintSolverTypeStrs = {
     "QP", "SQP", "interiorPoint"
-};
-const std::vector<std::string> Config::exactCCDTypeStrs = {
-    "none", "rootParity", "BSC", "rationalRootParity"
 };
 const std::vector<std::string> Config::constraintTypeStrs = {
     "volume", "graphics", "nonsmoothNewmark", "gapFunction", "CMR", "Verschoor", "STIV"
@@ -56,17 +47,11 @@ Config::Config(void)
 
 Config::~Config(void)
 {
-    for (auto& coI : collisionObjects) {
-        delete coI;
-    }
 }
 
 std::string getRootDirectory()
 {
-    std::string file_path(__FILE__);
-    std::string parent_dir = file_path.substr(0, file_path.find_last_of("/"));
-    std::string parent_parent_dir = parent_dir.substr(0, parent_dir.find_last_of("/"));
-    return parent_parent_dir;
+    return fs::path(__FILE__).parent_path().parent_path().string();
 }
 
 std::string resolvePath(
@@ -89,6 +74,24 @@ std::string resolvePath(
 
     // Return a path relative to the root directory of IPC
     return (fs::path(getRootDirectory()) / path).string();
+}
+
+template <typename T>
+bool getOptional(std::stringstream& sstream, T& val, const T& defaultVal)
+{
+    if (sstream.eof()) {
+        val = defaultVal;
+        return false;
+    }
+    long pos = sstream.tellg();
+    sstream >> val;
+    if (sstream.fail()) {
+        val = defaultVal;
+        sstream.clear();
+        sstream.seekg(pos);
+        return false;
+    }
+    return true;
 }
 
 int Config::loadFromFile(const std::string& p_filePath)
@@ -152,11 +155,12 @@ int Config::loadFromFile(const std::string& p_filePath)
                 animScriptType = AnimScripter<DIM>::getAnimScriptTypeByStr(type);
                 if (animScriptType == AST_MESHSEQ_FROMFILE) {
                     ss >> meshSeqFolderPath;
+                    meshSeqFolderPath = resolvePath(meshSeqFolderPath, p_filePath);
                 }
 
                 int params = 0;
                 ss >> params;
-                if (params == params && params > 0) {
+                if (params > 0) {
                     scriptParams.resize(params);
                     for (int i = 0; i < params; ++i) {
                         ss >> scriptParams[i];
@@ -198,6 +202,10 @@ int Config::loadFromFile(const std::string& p_filePath)
 
                     std::string path;
                     ss_shapes >> path;
+                    if (path.empty() || path[0] == '#') {
+                        shapeNum++; // This increase will be canceled out
+                        continue;
+                    }
                     path = resolvePath(path, p_filePath);
                     inputShapePaths.push_back(path);
                     double x, y, z;
@@ -235,14 +243,35 @@ int Config::loadFromFile(const std::string& p_filePath)
                             for (int i = 0; i < 12; ++i) {
                                 ss_shapes >> DBC[i];
                             }
-                            inputShapeDBC.push_back(std::pair<int, std::array<Eigen::Vector3d, 4>>(shapeI, { Eigen::Vector3d(DBC[0], DBC[1], DBC[2]), Eigen::Vector3d(DBC[3], DBC[4], DBC[5]), Eigen::Vector3d(DBC[6], DBC[7], DBC[8]), Eigen::Vector3d(DBC[9], DBC[10], DBC[11]) * M_PI / 180 }));
+                            // Optional start and stop time of DBC
+                            std::array<double, 2> timeRange;
+                            getOptional(ss_shapes, timeRange[0], 0.0);
+                            getOptional(ss_shapes, timeRange[1], std::numeric_limits<double>::infinity());
+
+                            inputShapeDBC.emplace_back(shapeI,
+                                InputDBC(
+                                    Eigen::Vector3d(DBC[0], DBC[1], DBC[2]), // bbox min
+                                    Eigen::Vector3d(DBC[3], DBC[4], DBC[5]), // bbox max
+                                    Eigen::Vector3d(DBC[6], DBC[7], DBC[8]), // linear velocity
+                                    Eigen::Vector3d(DBC[9], DBC[10], DBC[11]) * M_PI / 180, // angular velocity
+                                    timeRange));
                         }
                         else if (extra == "NBC") {
                             double NBC[9];
                             for (int i = 0; i < 9; ++i) {
                                 ss_shapes >> NBC[i];
                             }
-                            inputShapeNBC.push_back(std::pair<int, std::array<Eigen::Vector3d, 3>>(shapeI, { Eigen::Vector3d(NBC[0], NBC[1], NBC[2]), Eigen::Vector3d(NBC[3], NBC[4], NBC[5]), Eigen::Vector3d(NBC[6], NBC[7], NBC[8]) }));
+                            // Optional start and stop time of NBC
+                            std::array<double, 2> timeRange;
+                            getOptional(ss_shapes, timeRange[0], 0.0);
+                            getOptional(ss_shapes, timeRange[1], std::numeric_limits<double>::infinity());
+
+                            inputShapeNBC.emplace_back(shapeI,
+                                InputNBC(
+                                    Eigen::Vector3d(NBC[0], NBC[1], NBC[2]), // bbox min
+                                    Eigen::Vector3d(NBC[3], NBC[4], NBC[5]), // bbox max
+                                    Eigen::Vector3d(NBC[6], NBC[7], NBC[8]), // force
+                                    timeRange));
                         }
                         else if (extra == "initVel") {
                             ss_shapes >> initLV[0] >> initLV[1] >> initLV[2] >> initAV[0] >> initAV[1] >> initAV[2];
@@ -250,7 +279,30 @@ int Config::loadFromFile(const std::string& p_filePath)
                         else if (extra == "meshSeq") {
                             std::string meshSeqFolderPath;
                             ss_shapes >> meshSeqFolderPath;
+                            meshSeqFolderPath = resolvePath(meshSeqFolderPath, p_filePath);
                             inputShapeMeshSeqFolderPath.emplace_back(shapeI, meshSeqFolderPath);
+                        }
+                        else if (extra == "\\") {
+                            std::getline(file, line_shapes);
+                            ss_shapes = std::stringstream(line_shapes);
+                        }
+                        else if (extra[0] == '#') {
+                            while (!ss_shapes.eof()) {
+                                ss_shapes >> extra;
+                                if (extra == "\\") {
+                                    std::getline(file, line_shapes);
+                                    ss_shapes = std::stringstream(line_shapes);
+                                    break;
+                                }
+                            }
+                        }
+                        else {
+                            spdlog::error("Uknown keyword in shape line {:d}: {}", shapeI, extra);
+                        }
+
+                        if (!ss_shapes.eof() && ss_shapes.fail()) {
+                            spdlog::error("Failed to parse {} section of shape line {:d} ({})", extra, shapeI, ss_shapes.str());
+                            break;
                         }
                     }
                     inputShapeMaterials.push_back(Eigen::Vector3d(density, E, nu));
@@ -282,6 +334,7 @@ int Config::loadFromFile(const std::string& p_filePath)
 
                 std::string path;
                 ss_shapes >> path;
+                path = resolvePath(path, p_filePath);
 
                 double x, y, z;
                 ss_shapes >> x >> y >> z;
@@ -307,7 +360,6 @@ int Config::loadFromFile(const std::string& p_filePath)
                 for (int xi = 0; xi < count[0]; ++xi) {
                     for (int yi = 0; yi < count[1]; ++yi) {
                         for (int zi = 0; zi < count[2]; ++zi) {
-                            path = resolvePath(path, p_filePath);
                             inputShapePaths.emplace_back(path);
                             inputShapeTranslates.emplace_back(Eigen::Vector3d(posX + translationStep[0] * xi,
                                 posY + translationStep[1] * yi, posZ + translationStep[2] * zi));
@@ -369,7 +421,7 @@ int Config::loadFromFile(const std::string& p_filePath)
                 double groundFriction, groundY;
                 ss >> groundFriction >> groundY;
                 assert(groundFriction >= 0.0);
-                collisionObjects.emplace_back(new HalfSpace<DIM>(groundY, groundFriction));
+                collisionObjects.push_back(std::make_shared<HalfSpace<DIM>>(groundY, groundFriction));
             }
             else if (token == "halfSpace") {
                 Eigen::Matrix<double, DIM, 1> origin, normal;
@@ -385,12 +437,13 @@ int Config::loadFromFile(const std::string& p_filePath)
                 double stiffness, friction;
                 ss >> stiffness >> friction;
                 assert(friction >= 0.0);
-                collisionObjects.emplace_back(new HalfSpace<DIM>(origin,
-                    normal, Eigen::Matrix<double, DIM, 1>::Zero(), friction));
+                collisionObjects.push_back(std::make_shared<HalfSpace<DIM>>(
+                    origin, normal, Eigen::Matrix<double, DIM, 1>::Zero(), friction));
             }
             else if (token == "meshCO") {
                 std::string meshCOFilePath;
                 ss >> meshCOFilePath;
+                meshCOFilePath = resolvePath(meshCOFilePath, p_filePath);
 
                 Eigen::Matrix<double, DIM, 1> origin;
                 ss >> origin[0] >> origin[1];
@@ -413,9 +466,7 @@ int Config::loadFromFile(const std::string& p_filePath)
                                  .toRotationMatrix();
                 }
 
-                meshCOFilePath = resolvePath(meshCOFilePath, p_filePath);
-
-                meshCollisionObjects.emplace_back(new MeshCO<DIM>(meshCOFilePath.c_str(), origin, rotMat, scale, friction));
+                meshCollisionObjects.emplace_back(std::make_shared<MeshCO<DIM>>(meshCOFilePath.c_str(), origin, rotMat, scale, friction));
             }
             else if (token == "selfCollisionOn") {
                 isSelfCollision = true;
@@ -457,6 +508,7 @@ int Config::loadFromFile(const std::string& p_filePath)
             else if (token == "restart") {
                 restart = true;
                 ss >> statusPath;
+                statusPath = resolvePath(statusPath, p_filePath);
             }
 
             else if (token == "disableCout") {
@@ -493,15 +545,24 @@ int Config::loadFromFile(const std::string& p_filePath)
             else if (token == "fricIterAmt") {
                 ss >> fricIterAmt;
             }
+            else if (token == "useAbsParameters") {
+                useAbsParameters = true;
+            }
+            else if (token == "kappaMinMultiplier") {
+                ss >> kappaMinMultiplier;
+            }
 
             else if (token == "constraintOffset") {
                 ss >> constraintOffset;
                 spdlog::info("Using collision constraint offset: {:g}", constraintOffset);
             }
-            else if (token == "exactCCD") {
+            else if (token == "CCDMethod" || token == "ccdMethod") {
                 std::string type;
                 ss >> type;
-                this->exactCCDMethod = this->getExactCCDTypeByStr(type);
+                this->ccdMethod = this->getCCDMethodTypeByStr(type);
+            }
+            else if (token == "CCDTolerance" || token == "ccdTolerance") {
+                ss >> this->ccdTolerance;
             }
             else if (token == "section") {
                 std::string section;
@@ -544,7 +605,7 @@ int Config::loadFromFile(const std::string& p_filePath)
 
         file.close();
 
-        isConstrained = isSelfCollision || !(collisionObjects.empty() && meshCollisionObjects.empty());
+        isConstrained = isSelfCollision || !(collisionObjects.empty() && meshCollisionObjects.empty()) || constraintSolverType == CST_IP;
         if (dampingRatio > 0) {
             dampingStiff = dampingRatio * std::pow(dt, 3) * 3 / 4;
         }
@@ -554,7 +615,8 @@ int Config::loadFromFile(const std::string& p_filePath)
         spdlog::error("Unable to open input file: {:s}", p_filePath);
         return -1;
     }
-} // namespace IPC
+}
+
 void Config::backUpConfig(const std::string& p_filePath)
 {
     std::ifstream src(filePath, std::ios::binary);
@@ -567,8 +629,7 @@ void Config::appendInfoStr(std::string& inputStr) const
     std::string shapeName;
     int shapeI = 0;
     for (const auto& inputShapePathI : inputShapePaths) {
-        std::string fileName = inputShapePathI.substr(inputShapePathI.find_last_of('/') + 1);
-        shapeName += fileName.substr(0, fileName.find_last_of('.')) + "-";
+        shapeName += fs::path(inputShapePathI).stem().string() + "-";
         if (++shapeI >= 3) {
             if (shapeI > 3) {
                 shapeName += std::to_string(inputShapePaths.size() - 3) + "others_";
@@ -635,16 +696,17 @@ std::string Config::getStrByConstraintSolverType(ConstraintSolverType constraint
     assert(constraintSolverType < constraintSolverTypeStrs.size());
     return constraintSolverTypeStrs[constraintSolverType];
 }
-ExactCCD::Method Config::getExactCCDTypeByStr(const std::string& str)
+ccd::CCDMethod Config::getCCDMethodTypeByStr(const std::string& str)
 {
-    for (int i = 0; i < exactCCDTypeStrs.size(); i++) {
-        if (str == exactCCDTypeStrs[i]) {
-            return ExactCCD::Method(i);
+    for (int i = 0; i < ccd::CCDMethod::NUM_CCD_METHODS; i++) {
+        if (str == ccd::method_names[i]) {
+            return ccd::CCDMethod(i);
         }
     }
-    spdlog::error("Uknown exact CCD method: {:s}", str);
-    spdlog::info("Using default exact CCD method: none");
-    return ExactCCD::Method::NONE;
+    spdlog::error("Uknown CCD method: {}", str);
+    spdlog::info("Using default CCD method: {}",
+        ccd::method_names[ccd::CCDMethod::FLOATING_POINT_ROOT_FINDER]);
+    return ccd::CCDMethod::FLOATING_POINT_ROOT_FINDER;
 }
 CollisionConstraintType Config::getConstraintTypeByStr(const std::string& str)
 {

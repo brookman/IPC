@@ -11,10 +11,11 @@
 #include "AnimScripter.hpp"
 #include "CollisionObject.h"
 #include "CollisionConstraints.hpp"
-#include "ExactCCD.hpp"
+#include <ccd.hpp>
 
 #include <iostream>
 #include <map>
+#include <memory>
 
 namespace IPC {
 
@@ -43,6 +44,34 @@ enum QPSolverType {
     QP_GUROBI
 };
 
+struct InputDBC {
+    InputDBC(const Eigen::Vector3d& minBBox, const Eigen::Vector3d& maxBBox,
+        const Eigen::Vector3d& linearVelocity, const Eigen::Vector3d& angularVelocity,
+        const std::array<double, 2>& timeRange)
+        : minBBox(minBBox), maxBBox(maxBBox), linearVelocity(linearVelocity), angularVelocity(angularVelocity), timeRange(timeRange)
+    {
+    }
+
+    Eigen::Vector3d minBBox;
+    Eigen::Vector3d maxBBox;
+    Eigen::Vector3d linearVelocity;
+    Eigen::Vector3d angularVelocity;
+    std::array<double, 2> timeRange;
+};
+
+struct InputNBC {
+    InputNBC(const Eigen::Vector3d& minBBox, const Eigen::Vector3d& maxBBox,
+        const Eigen::Vector3d& force, const std::array<double, 2>& timeRange)
+        : minBBox(minBBox), maxBBox(maxBBox), force(force), timeRange(timeRange)
+    {
+    }
+
+    Eigen::Vector3d minBBox;
+    Eigen::Vector3d maxBBox;
+    Eigen::Vector3d force;
+    std::array<double, 2> timeRange;
+};
+
 class Config {
 public:
     std::string filePath;
@@ -54,8 +83,8 @@ public:
     AnimScriptType animScriptType = AST_NULL;
     double handleRatio = 0.01;
     std::string meshSeqFolderPath;
-    double DBCTimeRange[2] = { 0, __DBL_MAX__ };
-    double NBCTimeRange[2] = { 0, __DBL_MAX__ };
+    std::array<double, 2> DBCTimeRange = { 0.0, std::numeric_limits<double>::infinity() };
+    std::array<double, 2> NBCTimeRange = { 0.0, std::numeric_limits<double>::infinity() };
 
     double rho = 1000.0;
     bool withGravity = true;
@@ -84,8 +113,8 @@ public:
     std::vector<Eigen::Vector3d> inputShapeAVels;
     std::vector<std::array<Eigen::Vector3d, 2>> inputShapeInitVels;
     std::vector<std::pair<int, std::string>> inputShapeMeshSeqFolderPath;
-    std::vector<std::pair<int, std::array<Eigen::Vector3d, 4>>> inputShapeDBC;
-    std::vector<std::pair<int, std::array<Eigen::Vector3d, 3>>> inputShapeNBC;
+    std::vector<std::pair<int, InputDBC>> inputShapeDBC;
+    std::vector<std::pair<int, InputNBC>> inputShapeNBC;
 
     bool orthographic = false;
     double zoom = 1.0;
@@ -97,17 +126,20 @@ public:
     bool disableCout = false;
 
     // collision objects
-    std::vector<CollisionObject<DIM>*> collisionObjects;
-    std::vector<CollisionObject<DIM>*> meshCollisionObjects;
+    std::vector<std::shared_ptr<CollisionObject<DIM>>> collisionObjects;
+    std::vector<std::shared_ptr<CollisionObject<DIM>>> meshCollisionObjects;
 
     std::string appendStr;
 
     std::vector<double> tuning; // the parameter that is currently tuning
+    bool useAbsParameters = false;
+    double kappaMinMultiplier = 1e11;
     int fricIterAmt = 1;
     std::vector<double> scriptParams; // the parameters for setting script if any,
     // like initial velocity, position, etc
 
-    ExactCCD::Method exactCCDMethod = ExactCCD::Method::NONE;
+    ccd::CCDMethod ccdMethod = ccd::CCDMethod::FLOATING_POINT_ROOT_FINDER;
+    double ccdTolerance = 1e-6;
 
     /// @brief Constraint type for SQP method of handling collisions.
     CollisionConstraintType constraintType = CollisionConstraintType::VOLUME;
@@ -119,7 +151,6 @@ public:
     static const std::vector<std::string> energyTypeStrs;
     static const std::vector<std::string> timeIntegrationTypeStrs;
     static const std::vector<std::string> constraintSolverTypeStrs;
-    static const std::vector<std::string> exactCCDTypeStrs;
     static const std::vector<std::string> constraintTypeStrs;
     static const std::vector<std::string> QPSolverTypeStrs;
 
@@ -139,7 +170,7 @@ public:
     static std::string getStrByTimeIntegrationType(TimeIntegrationType timeIntegrationType);
     static ConstraintSolverType getConstraintSolverTypeByStr(const std::string& str);
     static std::string getStrByConstraintSolverType(ConstraintSolverType constraintSolverType);
-    static ExactCCD::Method getExactCCDTypeByStr(const std::string& str);
+    static ccd::CCDMethod getCCDMethodTypeByStr(const std::string& str);
     static CollisionConstraintType getConstraintTypeByStr(const std::string& str);
     static QPSolverType getQPSolverTypeByStr(const std::string& str);
 };

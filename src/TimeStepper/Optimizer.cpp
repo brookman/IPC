@@ -17,9 +17,12 @@
 #include "EigenLibSolver.hpp"
 #endif
 
+#include <igl/writeDMAT.h>
+
 #include "IglUtils.hpp"
 #include "BarrierFunctions.hpp"
 #include "Timer.hpp"
+#include "CCDUtils.hpp"
 
 #include <igl/avg_edge_length.h>
 #include <igl/face_areas.h>
@@ -39,6 +42,9 @@
 #include <numeric>
 
 #include <sys/stat.h> // for mkdir
+
+// #define SAVE_EXTREME_LINESEARCH_CCD
+// #define EXPORT_FRICTION_DATA
 
 extern const std::string outputFolderPath;
 
@@ -65,6 +71,93 @@ extern std::vector<int> compFAccSize;
 extern int numOfCCDFail;
 
 namespace IPC {
+
+#ifdef EXPORT_FRICTION_DATA
+static bool should_save_friction_data = true;
+
+template <int dim>
+void save_friction_data(
+    const Mesh<dim>& mesh,
+    const std::vector<MMCVID>& mmcvids,
+    const Eigen::VectorXd& lambda,
+    const std::vector<Eigen::Vector2d>& coords,
+    const std::vector<Eigen::Matrix<double, 3, 2>>& tangent_bases,
+    double dHat_squared,
+    double barrier_stiffness,
+    double epsv_times_h_squared,
+    double kappa)
+{
+    if (!should_save_friction_data) return;
+    return;
+
+    static int output_counter = 0;
+    std::string out_prefix = fmt::format("cube_cube_{:d}", output_counter++);
+
+    // Save the meshes
+    mesh.saveSurfaceMesh(fmt::format("{}_V0.obj", out_prefix), /*use_V_prev=*/true);
+    mesh.saveSurfaceMesh(fmt::format("{}_V1.obj", out_prefix), /*use_V_prev=*/false);
+
+    // Save the MMCVIDs
+    Eigen::MatrixXi mmcvids_matrix(mmcvids.size(), 4);
+    for (int i = 0; i < mmcvids.size(); i++) {
+        for (int j = 0; j < 4; j++) {
+            mmcvids_matrix(i, j) = mmcvids[i][j];
+        }
+    }
+    igl::writeDMAT(fmt::format("{}_mmcvids.dmat", out_prefix), mmcvids_matrix);
+
+    // Save the parameters
+    Eigen::Vector4d params;
+    params << dHat_squared, barrier_stiffness, epsv_times_h_squared, kappa;
+    igl::writeDMAT(fmt::format("{}_params.dmat", out_prefix), params);
+
+    // Save the normal force magnitudes
+    igl::writeDMAT(fmt::format("{}_lambda.dmat", out_prefix), lambda);
+
+    // Save the closes point coordinates
+    Eigen::MatrixXd coords_matrix(coords.size(), 2);
+    for (int i = 0; i < coords_matrix.rows(); i++) {
+        coords_matrix.row(i) = coords[i];
+    }
+    igl::writeDMAT(fmt::format("{}_coords.dmat", out_prefix), coords_matrix);
+
+    // Save the tangent bases
+    Eigen::MatrixXd tangent_bases_matrix(3 * tangent_bases.size(), 2);
+    for (int i = 0; i < tangent_bases.size(); i++) {
+        tangent_bases_matrix.middleRows(3 * i, 3) = tangent_bases[i];
+    }
+    igl::writeDMAT(fmt::format("{}_bases.dmat", out_prefix), tangent_bases_matrix);
+
+    // Compute the potential
+    double Ef;
+    SelfCollisionHandler<dim>::computeFrictionEnergy(
+        mesh.V, mesh.V_prev, mmcvids, lambda, coords, tangent_bases, Ef,
+        epsv_times_h_squared, kappa);
+    std::vector<double> energy = { { Ef } };
+    igl::writeDMAT(fmt::format("{}_energy.dmat", out_prefix), energy);
+
+    // Compute the gradient
+    Eigen::VectorXd friction_grad = Eigen::VectorXd::Zero(mesh.V.size());
+    SelfCollisionHandler<dim>::augmentFrictionGradient(
+        mesh.V, mesh.V_prev, mmcvids, lambda, coords, tangent_bases,
+        friction_grad, epsv_times_h_squared, kappa);
+    igl::writeDMAT(fmt::format("{}_grad.dmat", out_prefix), friction_grad);
+
+    // Compute the hessian
+    LinSysSolver<Eigen::VectorXi, Eigen::VectorXd>* friction_linSysSolver = new EigenLibSolver<Eigen::VectorXi, Eigen::VectorXd>();
+    std::vector<std::set<int>> vNeighbor_IP_new = mesh.vNeighbor;
+    SelfCollisionHandler<dim>::augmentConnectivity(mesh, mmcvids, vNeighbor_IP_new);
+    friction_linSysSolver->set_pattern(vNeighbor_IP_new, mesh.DBCVertexIds);
+    friction_linSysSolver->analyze_pattern();
+    friction_linSysSolver->setZero();
+    SelfCollisionHandler<dim>::augmentFrictionHessian(
+        mesh, mesh.V_prev, mmcvids, lambda, coords, tangent_bases,
+        friction_linSysSolver, epsv_times_h_squared, kappa, /*projectDBC=*/true);
+    Eigen::SparseMatrix<double> friction_hessian;
+    friction_linSysSolver->getCoeffMtr(friction_hessian);
+    igl::writeDMAT(fmt::format("{}_hess.dmat", out_prefix), Eigen::MatrixXd(friction_hessian));
+}
+#endif
 
 template <int dim>
 Optimizer<dim>::Optimizer(const Mesh<dim>& p_data0,
@@ -103,7 +196,10 @@ Optimizer<dim>::Optimizer(const Mesh<dim>& p_data0,
     if (animConfig.tuning.size() > 3) {
         dTolRel = animConfig.tuning[3];
     }
-    dTol = bboxDiagSize2 * dTolRel * dTolRel;
+    dTol = dTolRel * dTolRel;
+    if (!animConfig.useAbsParameters) {
+        dTol *= bboxDiagSize2;
+    }
     rho_DBC = 0.0;
 
     gravity.setZero();
@@ -175,6 +271,12 @@ Optimizer<dim>::Optimizer(const Mesh<dim>& p_data0,
     animScripter.initAnimScript(result, animConfig.collisionObjects,
         animConfig.meshCollisionObjects, animConfig.DBCTimeRange, animConfig.NBCTimeRange);
     result.saveBCNodes(outputFolderPath + "/BC_0.txt");
+
+    // Initialize these to zero in case they are missing from the status file
+    velocity = Eigen::VectorXd::Zero(result.V.rows() * dim);
+    dx_Elastic = Eigen::MatrixXd::Zero(result.V.rows(), dim);
+    acceleration = Eigen::MatrixXd::Zero(result.V.rows(), dim);
+
     if (animConfig.restart) {
         std::ifstream in(animConfig.statusPath.c_str());
         assert(in.is_open());
@@ -209,6 +311,20 @@ Optimizer<dim>::Optimizer(const Mesh<dim>& p_data0,
                     in >> velocity[velI];
                 }
             }
+            else if (token == "acceleration") {
+                spdlog::info("read restart acceleration");
+                int accRows, dim_in;
+                ss >> accRows >> dim_in;
+                assert(accRows <= result.V.rows());
+                assert(dim_in == result.V.cols());
+                acceleration.setZero(result.V.rows(), dim);
+                for (int vI = 0; vI < accRows; ++vI) {
+                    in >> acceleration(vI, 0) >> acceleration(vI, 1);
+                    if constexpr (dim == 3) {
+                        in >> acceleration(vI, 2);
+                    }
+                }
+            }
             else if (token == "dx_Elastic") {
                 spdlog::info("read restart dx_Elastic");
                 int dxERows, dim_in;
@@ -225,12 +341,9 @@ Optimizer<dim>::Optimizer(const Mesh<dim>& p_data0,
             }
         }
         in.close();
-        //TODO: load acceleration, also save acceleration in the saveStatus() function
     }
     else {
         animScripter.initVelocity(result, animConfig.scriptParams, velocity);
-        dx_Elastic = Eigen::MatrixXd::Zero(result.V.rows(), dim);
-        acceleration = Eigen::MatrixXd::Zero(result.V.rows(), dim);
     }
     result.V_prev = result.V;
     computeXTilta();
@@ -263,31 +376,41 @@ Optimizer<dim>::Optimizer(const Mesh<dim>& p_data0,
     if (animConfig.tuning.size() > 1) {
         dHatEps = animConfig.tuning[1];
     }
-    dHat = bboxDiagSize2 * dHatEps * dHatEps;
+    dHat = dHatEps * dHatEps;
+    if (!animConfig.useAbsParameters) {
+        dHat *= bboxDiagSize2;
+    }
 
-    dHatTarget = bboxDiagSize2 * 1.0e-6;
+    dHatTarget = 1.0e-6;
     if (animConfig.tuning.size() > 2) {
-        dHatTarget = animConfig.tuning[2] * animConfig.tuning[2] * bboxDiagSize2;
+        dHatTarget = animConfig.tuning[2] * animConfig.tuning[2];
+    }
+    if (!animConfig.useAbsParameters) {
+        dHatTarget *= bboxDiagSize2;
     }
 
     fricDHatThres = dHat; // enable friction only when collision dHat is smaller than fricDHatThres if it's not enabled initially
-    fricDHat0 = bboxDiagSize2 * 1.0e-6 * dtSq; // initial value of fricDHat
+    fricDHat0 = 1.0e-6 * dtSq; // initial value of fricDHat
     if (animConfig.tuning.size() > 4) {
-        fricDHat0 = bboxDiagSize2 * animConfig.tuning[4] * animConfig.tuning[4] * dtSq;
+        fricDHat0 = animConfig.tuning[4] * animConfig.tuning[4] * dtSq;
     }
-    fricDHatTarget = bboxDiagSize2 * 1.0e-6 * dtSq;
+    fricDHatTarget = 1.0e-6 * dtSq;
     if (animConfig.tuning.size() > 5) {
-        fricDHatTarget = bboxDiagSize2 * animConfig.tuning[5] * animConfig.tuning[5] * dtSq;
+        fricDHatTarget = animConfig.tuning[5] * animConfig.tuning[5] * dtSq;
+    }
+    if (!animConfig.useAbsParameters) {
+        fricDHat0 *= bboxDiagSize2;
+        fricDHatTarget *= bboxDiagSize2;
     }
     fricDHat = solveFric ? fricDHat0 : -1.0;
 
-    mu_IP = 0.0;
+    kappa = 0.0;
     if (animConfig.tuning.size() > 0) {
-        mu_IP = animConfig.tuning[0];
-        upperBoundMu(mu_IP);
+        kappa = animConfig.tuning[0];
+        upperBoundKappa(kappa);
     }
-    if (mu_IP == 0.0) {
-        suggestMu(mu_IP);
+    if (kappa == 0.0) {
+        suggestKappa(kappa);
     }
 
     // output wire.poly for rendering
@@ -354,6 +477,11 @@ int Optimizer<dim>::getIterNum(void) const
     return globalIterNum;
 }
 template <int dim>
+int Optimizer<dim>::getFrameAmt(void) const
+{
+    return frameAmt;
+}
+template <int dim>
 int Optimizer<dim>::getInnerIterAmt(void) const
 {
     return innerIterAmt;
@@ -372,6 +500,12 @@ template <int dim>
 double Optimizer<dim>::getDt(void) const
 {
     return dt;
+}
+
+template <int dim>
+const AnimScripter<dim>& Optimizer<dim>::getAnimScripter() const
+{
+    return animScripter;
 }
 
 template <int dim>
@@ -425,9 +559,9 @@ void Optimizer<dim>::precompute(void)
 {
     spdlog::info("precompute: start");
     if (!mute) { timer_step.start(1); }
-    linSysSolver->set_pattern(result.vNeighbor, result.fixedVert);
+    linSysSolver->set_pattern(result.vNeighbor, result.DBCVertexIds);
     if (animConfig.dampingStiff) {
-        dampingMtr->set_pattern(result.vNeighbor, result.fixedVert);
+        dampingMtr->set_pattern(result.vNeighbor, result.DBCVertexIds);
     }
     if (!mute) { timer_step.stop(); }
     spdlog::info("precompute: sparse matrix allocated");
@@ -490,7 +624,7 @@ int Optimizer<dim>::solve(int maxIter)
 
         if (animScripter.stepAnimScript(result, sh,
                 animConfig.collisionObjects, animConfig.meshCollisionObjects,
-                animConfig.exactCCDMethod, dt, dHat, energyTerms, animConfig.isSelfCollision,
+                animConfig.ccdMethod, dt, dHat, energyTerms, animConfig.isSelfCollision,
                 /*forceIntersectionLineSearch=*/solveIP)) {
             result.saveBCNodes(outputFolderPath + "/BC_" + std::to_string(globalIterNum) + ".txt");
             updatePrecondMtrAndFactorize();
@@ -535,20 +669,23 @@ int Optimizer<dim>::solve(int maxIter)
             }
 
             timer_step.start(11);
+            typedef Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> RowMatrixXd;
             switch (animConfig.timeIntegrationType) {
-            case TIT_BE:
+            case TIT_BE: {
                 dx_Elastic = result.V - xTilta;
-                velocity = Eigen::Map<Eigen::MatrixXd>(Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>((result.V - result.V_prev).array() / dt).data(), velocity.rows(), 1);
+                Eigen::VectorXd velocity_prev = velocity; // temporary storage
+                velocity = Eigen::Map<Eigen::VectorXd>(RowMatrixXd((result.V - result.V_prev).array() / dt).data(), velocity.rows());
+                acceleration = RowMatrixXd::Map(((velocity - velocity_prev) / dt).eval().data(), acceleration.rows(), acceleration.cols());
                 result.V_prev = result.V;
                 computeXTilta();
-                break;
+            } break;
 
             case TIT_NM:
                 dx_Elastic = result.V - xTilta;
-                velocity = velocity + dt * (1 - gamma_NM) * Eigen::Map<Eigen::MatrixXd>(Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>(acceleration).data(), velocity.rows(), 1);
+                velocity = velocity + dt * (1 - gamma_NM) * Eigen::Map<Eigen::MatrixXd>(RowMatrixXd(acceleration).data(), velocity.rows(), 1);
                 acceleration = (result.V - xTilta) / (dtSq * beta_NM);
                 acceleration.rowwise() += gravity.transpose();
-                velocity += dt * gamma_NM * Eigen::Map<Eigen::MatrixXd>(Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>(acceleration).data(), velocity.rows(), 1);
+                velocity += dt * gamma_NM * Eigen::Map<Eigen::MatrixXd>(RowMatrixXd(acceleration).data(), velocity.rows(), 1);
                 result.V_prev = result.V;
                 computeXTilta();
                 break;
@@ -573,9 +710,9 @@ void Optimizer<dim>::updatePrecondMtrAndFactorize(void)
     }
 
     if (!mute) { timer_step.start(1); }
-    linSysSolver->set_pattern(solveIP ? vNeighbor_IP : result.vNeighbor, result.fixedVert);
+    linSysSolver->set_pattern(solveIP ? vNeighbor_IP : result.vNeighbor, result.DBCVertexIds);
     if (animConfig.dampingStiff) {
-        dampingMtr->set_pattern(solveIP ? vNeighbor_IP : result.vNeighbor, result.fixedVert);
+        dampingMtr->set_pattern(solveIP ? vNeighbor_IP : result.vNeighbor, result.DBCVertexIds);
     }
     if (!mute) { timer_step.start(2); }
     linSysSolver->analyze_pattern();
@@ -645,7 +782,7 @@ void Optimizer<dim>::updateQPObjective(
 template <int dim>
 void Optimizer<dim>::computeQPInequalityConstraint(
     const Mesh<dim>& mesh,
-    const std::vector<CollisionObject<dim>*>& collisionObjects,
+    const std::vector<std::shared_ptr<CollisionObject<dim>>>& collisionObjects,
     const std::vector<std::vector<int>>& activeSet,
     const int num_vars,
     std::vector<int>& constraintStartInds,
@@ -689,7 +826,7 @@ void Optimizer<dim>::computeQPInequalityConstraint(
 template <int dim>
 bool Optimizer<dim>::solveQP(
     const Mesh<dim>& mesh,
-    const std::vector<CollisionObject<dim>*>& collisionObjects,
+    const std::vector<std::shared_ptr<CollisionObject<dim>>>& collisionObjects,
     const std::vector<std::vector<int>>& activeSet,
     const LinSysSolver<Eigen::VectorXi, Eigen::VectorXd>* linSys,
     Eigen::SparseMatrix<double>& P,
@@ -829,7 +966,7 @@ bool Optimizer<dim>::solveQP_Gurobi(
 
 template <int dim>
 void Optimizer<dim>::computeQPResidual(const Mesh<dim>& mesh,
-    const std::vector<CollisionObject<dim>*>& collisionObjects,
+    const std::vector<std::shared_ptr<CollisionObject<dim>>>& collisionObjects,
     const std::vector<std::vector<int>>& activeSet,
     const std::vector<int>& constraintStartInds,
     const Eigen::VectorXd& gradient,
@@ -903,7 +1040,7 @@ void Optimizer<dim>::initX(int option, std::vector<std::vector<int>>& p_activeSe
         for (int vI = 0; vI < result.V.rows(); vI++)
 #endif
             {
-                if (result.isFixedVert[vI]) {
+                if (result.isDBCVertex(vI)) {
                     searchDir.segment<dim>(vI * dim).setZero();
                 }
                 else {
@@ -924,7 +1061,7 @@ void Optimizer<dim>::initX(int option, std::vector<std::vector<int>>& p_activeSe
             for (int vI = 0; vI < result.V.rows(); vI++)
 #endif
                 {
-                    if (result.isFixedVert[vI]) {
+                    if (result.isDBCVertex(vI)) {
                         searchDir.segment<dim>(vI * dim).setZero();
                     }
                     else {
@@ -943,7 +1080,7 @@ void Optimizer<dim>::initX(int option, std::vector<std::vector<int>>& p_activeSe
             for (int vI = 0; vI < result.V.rows(); vI++)
 #endif
                 {
-                    if (result.isFixedVert[vI]) {
+                    if (result.isDBCVertex(vI)) {
                         searchDir.segment<dim>(vI * dim).setZero();
                     }
                     else {
@@ -966,7 +1103,7 @@ void Optimizer<dim>::initX(int option, std::vector<std::vector<int>>& p_activeSe
             for (int vI = 0; vI < result.V.rows(); vI++)
 #endif
                 {
-                    if (result.isFixedVert[vI]) {
+                    if (result.isDBCVertex(vI)) {
                         searchDir.segment<dim>(vI * dim).setZero();
                     }
                     else {
@@ -985,7 +1122,7 @@ void Optimizer<dim>::initX(int option, std::vector<std::vector<int>>& p_activeSe
             for (int vI = 0; vI < result.V.rows(); vI++)
 #endif
                 {
-                    if (result.isFixedVert[vI]) {
+                    if (result.isDBCVertex(vI)) {
                         searchDir.segment<dim>(vI * dim).setZero();
                     }
                     else {
@@ -1009,7 +1146,7 @@ void Optimizer<dim>::initX(int option, std::vector<std::vector<int>>& p_activeSe
             for (int vI = 0; vI < result.V.rows(); vI++)
 #endif
                 {
-                    if (result.isFixedVert[vI]) {
+                    if (result.isDBCVertex(vI)) {
                         searchDir.segment<dim>(vI * dim).setZero();
                     }
                     else {
@@ -1028,7 +1165,7 @@ void Optimizer<dim>::initX(int option, std::vector<std::vector<int>>& p_activeSe
             for (int vI = 0; vI < result.V.rows(); vI++)
 #endif
                 {
-                    if (result.isFixedVert[vI]) {
+                    if (result.isDBCVertex(vI)) {
                         searchDir.segment<dim>(vI * dim).setZero();
                     }
                     else {
@@ -1057,7 +1194,7 @@ void Optimizer<dim>::initX(int option, std::vector<std::vector<int>>& p_activeSe
         for (int vI = 0; vI < result.V.rows(); vI++)
 #endif
             {
-                if (result.isFixedVert[vI]) {
+                if (result.isDBCVertex(vI)) {
                     searchDir.segment<dim>(vI * dim).setZero();
                 }
                 else {
@@ -1101,21 +1238,39 @@ void Optimizer<dim>::initX(int option, std::vector<std::vector<int>>& p_activeSe
 #endif
             for (int coI = 0; coI < animConfig.meshCollisionObjects.size(); coI++) {
                 MMActiveSet_next[coI].resize(0);
-                if (animConfig.exactCCDMethod == ExactCCD::Method::NONE) {
-                    animConfig.meshCollisionObjects[coI]->largestFeasibleStepSize_CCD(result, sh, searchDir, slackness_m, stepSize);
-                }
-                else {
-                    animConfig.meshCollisionObjects[coI]->largestFeasibleStepSize_CCD_exact(result, sh, searchDir, animConfig.exactCCDMethod, stepSize);
+                switch (animConfig.ccdMethod) {
+                case ccd::CCDMethod::FLOATING_POINT_ROOT_FINDER:
+                    animConfig.meshCollisionObjects[coI]->largestFeasibleStepSize_CCD(
+                        result, sh, searchDir, slackness_m, stepSize);
+                    break;
+
+                case ccd::CCDMethod::TIGHT_INCLUSION:
+                    animConfig.meshCollisionObjects[coI]->largestFeasibleStepSize_CCD_TightInclusion(
+                        result, sh, searchDir, animConfig.ccdTolerance, stepSize);
+                    break;
+
+                default:
+                    animConfig.meshCollisionObjects[coI]->largestFeasibleStepSize_CCD_exact(
+                        result, sh, searchDir, animConfig.ccdMethod, stepSize);
                 }
             }
             if (animConfig.isSelfCollision) {
                 MMActiveSet_next.back().resize(0);
-                if (animConfig.exactCCDMethod == ExactCCD::Method::NONE) {
-                    std::vector<std::pair<int, int>> newCandidates;
-                    SelfCollisionHandler<dim>::largestFeasibleStepSize_CCD(result, sh, searchDir, slackness_m, newCandidates, stepSize);
-                }
-                else {
-                    SelfCollisionHandler<dim>::largestFeasibleStepSize_CCD_exact(result, sh, searchDir, animConfig.exactCCDMethod, stepSize);
+                std::vector<std::pair<int, int>> newCandidates;
+                switch (animConfig.ccdMethod) {
+                case ccd::CCDMethod::FLOATING_POINT_ROOT_FINDER:
+                    SelfCollisionHandler<dim>::largestFeasibleStepSize_CCD(
+                        result, sh, searchDir, slackness_m, newCandidates, stepSize);
+                    break;
+
+                case ccd::CCDMethod::TIGHT_INCLUSION:
+                    SelfCollisionHandler<dim>::largestFeasibleStepSize_CCD_TightInclusion(
+                        result, sh, searchDir, animConfig.ccdTolerance, newCandidates, stepSize);
+                    break;
+
+                default:
+                    SelfCollisionHandler<dim>::largestFeasibleStepSize_CCD_exact(
+                        result, sh, searchDir, animConfig.ccdMethod, stepSize);
                 }
             }
 
@@ -1180,7 +1335,7 @@ void Optimizer<dim>::computeXTilta(void)
         for (int vI = 0; vI < result.V.rows(); vI++)
 #endif
             {
-                if (result.isFixedVert[vI]) {
+                if (result.isDBCVertex(vI)) {
                     xTilta.row(vI) = result.V_prev.row(vI);
                 }
                 else {
@@ -1199,7 +1354,7 @@ void Optimizer<dim>::computeXTilta(void)
         for (int vI = 0; vI < result.V.rows(); vI++)
 #endif
             {
-                if (result.isFixedVert[vI]) {
+                if (result.isDBCVertex(vI)) {
                     xTilta.row(vI) = result.V_prev.row(vI);
                 }
                 else {
@@ -1242,13 +1397,15 @@ bool Optimizer<dim>::updateActiveSet_QP()
     for (int coI = 0; coI < animConfig.meshCollisionObjects.size(); coI++) {
         newConstraintsAdded |= animConfig.meshCollisionObjects[coI]->updateActiveSet_QP(
             result, searchDir, animConfig.constraintType,
-            MMActiveSet_next[coI], eta);
+            MMActiveSet_next[coI], animConfig.ccdMethod, eta,
+            animConfig.ccdTolerance);
         MMActiveSet[coI] = MMActiveSet_next[coI];
     }
     if (animConfig.isSelfCollision) {
         newConstraintsAdded |= SelfCollisionHandler<dim>::updateActiveSet_QP(
             result, searchDir, animConfig.constraintType,
-            MMActiveSet_next.back(), mesh_mmcvid_to_toi, eta);
+            MMActiveSet_next.back(), mesh_mmcvid_to_toi, animConfig.ccdMethod,
+            eta, animConfig.ccdTolerance);
         MMActiveSet.back() = MMActiveSet_next.back();
     }
     return newConstraintsAdded;
@@ -1291,12 +1448,12 @@ bool Optimizer<dim>::fullyImplicit(void)
     int constraintAmt = countConstraints();
     spdlog::debug("after initX: E={:g} ||g||²={:g} targetGRes={:g} constraintAmt={:d}",
         lastEnergyVal, gradient.squaredNorm(), targetGRes, constraintAmt);
-    file_iterStats << globalIterNum << " 0 " << lastEnergyVal << " "
-                   << gradient.squaredNorm() << " 0" << std::endl;
+    file_iterStats << fmt::format("{:d} 0 {:g} {:g} 0\n",
+        globalIterNum, lastEnergyVal, gradient.squaredNorm());
 
     // Termination criteria variables
     Eigen::VectorXd fb;
-    double sqn_g = __DBL_MAX__, sqn_g0;
+    double sqn_g = std::numeric_limits<double>::infinity(), sqn_g0;
     int iterCap = 10000, curIterI = 0;
     bool newConstraintsAdded = false;
 
@@ -1349,7 +1506,8 @@ bool Optimizer<dim>::fullyImplicit(void)
             sqn_g0 = sqn_g;
         }
 
-        file_iterStats << lastEnergyVal << " " << sqn_g << " " << (constraintStartInds.empty() ? 0 : constraintStartInds.back()) << std::endl;
+        file_iterStats << fmt::format("{:g} {:g} {:d}\n",
+            lastEnergyVal, sqn_g, (constraintStartInds.empty() ? 0 : constraintStartInds.back()));
         timer_step.stop();
 
         constraintAmt = countConstraints();
@@ -1464,19 +1622,22 @@ bool Optimizer<dim>::fullyImplicit_IP(void)
     timer_step.stop();
 
     fricDHat = solveFric ? fricDHat0 : -1.0;
-    dHat = bboxDiagSize2 * dHatEps * dHatEps;
+    dHat = dHatEps * dHatEps;
+    if (!animConfig.useAbsParameters) {
+        dHat *= bboxDiagSize2;
+    }
     computeConstraintSets(result);
 
-    mu_IP = 0.0;
+    kappa = 0.0;
     if (animConfig.tuning.size() > 0) {
-        mu_IP = animConfig.tuning[0];
-        upperBoundMu(mu_IP);
+        kappa = animConfig.tuning[0];
+        upperBoundKappa(kappa);
     }
-    if (mu_IP == 0.0) {
-        suggestMu(mu_IP);
+    if (kappa == 0.0) {
+        suggestKappa(kappa);
     }
-#ifdef ADAPTIVE_MU
-    initMu_IP(mu_IP);
+#ifdef ADAPTIVE_KAPPA
+    initKappa(kappa);
 #endif
 
     timer_step.start(10);
@@ -1492,7 +1653,7 @@ bool Optimizer<dim>::fullyImplicit_IP(void)
             //TODO: parallelize
             for (int i = 0; i < lambda_lastH[coI].size(); ++i) {
                 compute_g_b(constraintVal[startCI + i], dHat, lambda_lastH[coI][i]);
-                lambda_lastH[coI][i] *= -mu_IP * 2.0 * std::sqrt(constraintVal[startCI + i]);
+                lambda_lastH[coI][i] *= -kappa * 2.0 * std::sqrt(constraintVal[startCI + i]);
             }
 
             if (activeSet_lastH[coI] != activeSet[coI]) {
@@ -1514,7 +1675,7 @@ bool Optimizer<dim>::fullyImplicit_IP(void)
             //TODO: parallelize
             for (int i = 0; i < MMLambda_lastH.back().size(); ++i) {
                 compute_g_b(constraintVal[startCI + i], dHat, MMLambda_lastH.back()[i]);
-                MMLambda_lastH.back()[i] *= -mu_IP * 2.0 * std::sqrt(constraintVal[startCI + i]);
+                MMLambda_lastH.back()[i] *= -kappa * 2.0 * std::sqrt(constraintVal[startCI + i]);
                 if (MMActiveSet.back()[i][3] < -1) {
                     // PP or PE duplication
                     MMLambda_lastH.back()[i] *= -MMActiveSet.back()[i][3];
@@ -1539,7 +1700,7 @@ bool Optimizer<dim>::fullyImplicit_IP(void)
     int fricIterI = 0;
     while (true) {
         initSubProb_IP();
-        solveSub_IP(mu_IP, activeSet_next, MMActiveSet_next);
+        solveSub_IP(kappa, activeSet_next, MMActiveSet_next);
         ++fricIterI;
 
         timer_step.start(10);
@@ -1555,7 +1716,7 @@ bool Optimizer<dim>::fullyImplicit_IP(void)
                 //TODO: parallelize
                 for (int i = 0; i < lambda_lastH[coI].size(); ++i) {
                     compute_g_b(constraintVal[startCI + i], dHat, lambda_lastH[coI][i]);
-                    lambda_lastH[coI][i] *= -mu_IP * 2.0 * std::sqrt(constraintVal[startCI + i]);
+                    lambda_lastH[coI][i] *= -kappa * 2.0 * std::sqrt(constraintVal[startCI + i]);
                 }
 
                 if (activeSet_lastH[coI] != activeSet[coI]) {
@@ -1577,7 +1738,7 @@ bool Optimizer<dim>::fullyImplicit_IP(void)
                 //TODO: parallelize
                 for (int i = 0; i < MMLambda_lastH.back().size(); ++i) {
                     compute_g_b(constraintVal[startCI + i], dHat, MMLambda_lastH.back()[i]);
-                    MMLambda_lastH.back()[i] *= -mu_IP * 2.0 * std::sqrt(constraintVal[startCI + i]);
+                    MMLambda_lastH.back()[i] *= -kappa * 2.0 * std::sqrt(constraintVal[startCI + i]);
                     if (MMActiveSet.back()[i][3] < -1) {
                         // PP or PE duplication
                         MMLambda_lastH.back()[i] *= -MMActiveSet.back()[i][3];
@@ -1608,7 +1769,7 @@ bool Optimizer<dim>::fullyImplicit_IP(void)
                 {
                     double dualI;
                     compute_g_b(constraintVal[i], dHat, dualI);
-                    dualI *= -mu_IP;
+                    dualI *= -kappa;
                     const double& constraint = constraintVal[i];
                     fb[i] = (dualI + constraint - std::sqrt(dualI * dualI + constraint * constraint));
                 }
@@ -1640,7 +1801,13 @@ bool Optimizer<dim>::fullyImplicit_IP(void)
                     // compute gradient with updated tangent,
                     // if gradient still below CNTol,
                     // then friction tangent space has converged
+#ifdef EXPORT_FRICTION_DATA
+                    should_save_friction_data = false;
+#endif
                     computeGradient(result, false, gradient, true);
+#ifdef EXPORT_FRICTION_DATA
+                    should_save_friction_data = true;
+#endif
                     computePrecondMtr(result, false, linSysSolver, false, true);
                     if (!linSysSolver->factorize()) {
                         linSysSolver->precondition_diag(gradient, searchDir);
@@ -1679,8 +1846,8 @@ bool Optimizer<dim>::fullyImplicit_IP(void)
         }
 
         if constexpr (HOMOTOPY_VAR == 0) {
-            mu_IP *= 0.5;
-            spdlog::info("mu decreased to {:g}", mu_IP);
+            kappa *= 0.5;
+            spdlog::info("kappa decreased to {:g}", kappa);
         }
         else if (HOMOTOPY_VAR == 1) {
             if (updateDHat) {
@@ -1690,8 +1857,8 @@ bool Optimizer<dim>::fullyImplicit_IP(void)
                 }
                 computeConstraintSets(result);
                 spdlog::info("dHat decreased to {:g}", dHat);
-#ifdef ADAPTIVE_MU
-                initMu_IP(mu_IP);
+#ifdef ADAPTIVE_KAPPA
+                initKappa(kappa);
 #endif
             }
 
@@ -1703,7 +1870,7 @@ bool Optimizer<dim>::fullyImplicit_IP(void)
             }
         }
         else {
-            spdlog::error("needs to define HOMOTOPY_VAR to either 0 (mu) or 1 (dHat)");
+            spdlog::error("needs to define HOMOTOPY_VAR to either 0 (kappa) or 1 (dHat)");
             exit(-1);
         }
     }
@@ -1741,7 +1908,7 @@ bool Optimizer<dim>::fullyImplicit_IP(void)
 }
 
 template <int dim>
-bool Optimizer<dim>::solveSub_IP(double mu, std::vector<std::vector<int>>& AHat,
+bool Optimizer<dim>::solveSub_IP(double kappa, std::vector<std::vector<int>>& AHat,
     std::vector<std::vector<MMCVID>>& MMAHat)
 {
     int iterCap = 10000, k = 0; // 10000 for running comparative schemes that can potentially not converge
@@ -1784,19 +1951,19 @@ bool Optimizer<dim>::solveSub_IP(double mu, std::vector<std::vector<int>>& AHat,
         timer_step.stop();
         //TODO: constraint val can be computed and reused for E, g, H
 
-        spdlog::info("# constraint = {:d}", MMActiveSet.back().size());
-        spdlog::info("# paraEE = {:d}", paraEEMMCVIDSet.back().size());
+        spdlog::info("# constraint = {:d}", MMActiveSet.size() ? MMActiveSet.back().size() : 0);
+        spdlog::info("# paraEE = {:d}", paraEEMMCVIDSet.size() ? paraEEMMCVIDSet.back().size() : 0);
 
         // check convergence
         double gradSqNorm = gradient.squaredNorm();
         double distToOpt_PN = searchDir.cwiseAbs().maxCoeff();
-        spdlog::info("mu = {:g}, dHat = {:g}, {:g}, subproblem ||g||^2 = {:g}", mu_IP, dHat, fricDHat, gradSqNorm);
+        spdlog::info("kappa = {:g}, dHat = {:g}, eps_v = {:g}, subproblem ||g||^2 = {:g}", kappa, dHat, fricDHat, gradSqNorm);
         spdlog::info("distToOpt_PN = {:g}, targetGRes = {:g}", distToOpt_PN, targetGRes);
         bool gradVanish = (distToOpt_PN < targetGRes);
         if (!useGD && k && gradVanish && (animScripter.getCompletedStepSize() > 1.0 - 1.0e-3)
             && (animScripter.getCOCompletedStepSize() > 1.0 - 1.0e-3)) {
             // subproblem converged
-            logFile << k << " Newton-type iterations for mu = " << mu_IP << ", dHat = " << dHat << std::endl;
+            logFile << k << " Newton-type iterations for kappa = " << kappa << ", dHat = " << dHat << std::endl;
             return false;
         }
         innerIterAmt++;
@@ -1819,20 +1986,40 @@ bool Optimizer<dim>::solveSub_IP(double mu, std::vector<std::vector<int>>& AHat,
 #endif
         // full CCD or partial CCD
         for (int coI = 0; coI < animConfig.meshCollisionObjects.size(); ++coI) {
-            if (animConfig.exactCCDMethod == ExactCCD::Method::NONE) {
-                animConfig.meshCollisionObjects[coI]->largestFeasibleStepSize(result, sh, searchDir, slackness_m, MMActiveSet_CCD[coI], alpha);
-            }
-            else {
-                animConfig.meshCollisionObjects[coI]->largestFeasibleStepSize_exact(result, sh, searchDir, animConfig.exactCCDMethod, MMActiveSet_CCD[coI], alpha);
+            switch (animConfig.ccdMethod) {
+            case ccd::CCDMethod::FLOATING_POINT_ROOT_FINDER:
+                animConfig.meshCollisionObjects[coI]->largestFeasibleStepSize(
+                    result, sh, searchDir, slackness_m, MMActiveSet_CCD[coI], alpha);
+                break;
+
+            case ccd::CCDMethod::TIGHT_INCLUSION:
+                animConfig.meshCollisionObjects[coI]->largestFeasibleStepSize_TightInclusion(
+                    result, sh, searchDir, animConfig.ccdTolerance, MMActiveSet_CCD[coI], alpha);
+                break;
+
+            default:
+                animConfig.meshCollisionObjects[coI]->largestFeasibleStepSize_exact(
+                    result, sh, searchDir, animConfig.ccdMethod, MMActiveSet_CCD[coI], alpha);
+                break;
             }
         }
         std::vector<std::pair<int, int>> newCandidates;
         if (animConfig.isSelfCollision) {
-            if (animConfig.exactCCDMethod == ExactCCD::Method::NONE) {
-                SelfCollisionHandler<dim>::largestFeasibleStepSize(result, sh, searchDir, slackness_m, MMActiveSet_CCD.back(), newCandidates, alpha);
-            }
-            else {
-                SelfCollisionHandler<dim>::largestFeasibleStepSize_exact(result, sh, searchDir, animConfig.exactCCDMethod, MMActiveSet_CCD.back(), alpha);
+            switch (animConfig.ccdMethod) {
+            case ccd::CCDMethod::FLOATING_POINT_ROOT_FINDER:
+                SelfCollisionHandler<dim>::largestFeasibleStepSize(
+                    result, sh, searchDir, slackness_m, MMActiveSet_CCD.back(), newCandidates, alpha);
+                break;
+
+            case ccd::CCDMethod::TIGHT_INCLUSION:
+                SelfCollisionHandler<dim>::largestFeasibleStepSize_TightInclusion(
+                    result, sh, searchDir, animConfig.ccdTolerance, MMActiveSet_CCD.back(), newCandidates, alpha);
+                break;
+
+            default:
+                SelfCollisionHandler<dim>::largestFeasibleStepSize_exact(
+                    result, sh, searchDir, animConfig.ccdMethod, MMActiveSet_CCD.back(), alpha);
+                break;
             }
         }
 
@@ -1858,19 +2045,38 @@ bool Optimizer<dim>::solveSub_IP(double mu, std::vector<std::vector<int>>& AHat,
                     timer_temp3.stop();
 #endif
                     for (int coI = 0; coI < animConfig.meshCollisionObjects.size(); ++coI) {
-                        if (animConfig.exactCCDMethod == ExactCCD::Method::NONE) {
-                            animConfig.meshCollisionObjects[coI]->largestFeasibleStepSize_CCD(result, sh, searchDir, slackness_m, alpha);
-                        }
-                        else {
-                            animConfig.meshCollisionObjects[coI]->largestFeasibleStepSize_CCD_exact(result, sh, searchDir, animConfig.exactCCDMethod, alpha);
+                        switch (animConfig.ccdMethod) {
+                        case ccd::CCDMethod::FLOATING_POINT_ROOT_FINDER:
+                            animConfig.meshCollisionObjects[coI]->largestFeasibleStepSize_CCD(
+                                result, sh, searchDir, slackness_m, alpha);
+                            break;
+
+                        case ccd::CCDMethod::TIGHT_INCLUSION:
+                            animConfig.meshCollisionObjects[coI]->largestFeasibleStepSize_CCD_TightInclusion(
+                                result, sh, searchDir, animConfig.ccdTolerance, alpha);
+                            break;
+
+                        default:
+                            animConfig.meshCollisionObjects[coI]->largestFeasibleStepSize_CCD_exact(
+                                result, sh, searchDir, animConfig.ccdMethod, alpha);
                         }
                     }
+
                     if (animConfig.isSelfCollision) {
-                        if (animConfig.exactCCDMethod == ExactCCD::Method::NONE) {
-                            SelfCollisionHandler<dim>::largestFeasibleStepSize_CCD(result, sh, searchDir, slackness_m, newCandidates, alpha);
-                        }
-                        else {
-                            SelfCollisionHandler<dim>::largestFeasibleStepSize_CCD_exact(result, sh, searchDir, animConfig.exactCCDMethod, alpha);
+                        switch (animConfig.ccdMethod) {
+                        case ccd::CCDMethod::FLOATING_POINT_ROOT_FINDER:
+                            SelfCollisionHandler<dim>::largestFeasibleStepSize_CCD(
+                                result, sh, searchDir, slackness_m, newCandidates, alpha);
+                            break;
+
+                        case ccd::CCDMethod::TIGHT_INCLUSION:
+                            SelfCollisionHandler<dim>::largestFeasibleStepSize_CCD_TightInclusion(
+                                result, sh, searchDir, animConfig.ccdTolerance, newCandidates, alpha);
+                            break;
+
+                        default:
+                            SelfCollisionHandler<dim>::largestFeasibleStepSize_CCD_exact(
+                                result, sh, searchDir, animConfig.ccdMethod, alpha);
                         }
                     }
 
@@ -1892,10 +2098,13 @@ bool Optimizer<dim>::solveSub_IP(double mu, std::vector<std::vector<int>>& AHat,
         // double largestFeasibleStepSize = alpha;
 
         if (alpha == 0.0) {
-            spdlog::info("CCD gives 0 step size");
+            spdlog::error("CCD gives 0 step size");
             exit(-1);
 
             alpha = 1.0; // fail-safe, let safe-guard in line search find the stepsize
+        }
+        else {
+            spdlog::info("stepsize={:g}", alpha);
         }
         timer_step.stop();
 
@@ -1903,6 +2112,19 @@ bool Optimizer<dim>::solveSub_IP(double mu, std::vector<std::vector<int>>& AHat,
 
         // Eigen::MatrixXd Vlast = result.V;
         double alpha_feasible = alpha;
+#ifdef SAVE_EXTREME_LINESEARCH_CCD
+        if (alpha_feasible < 0.25) {
+            static int count = 0;
+            Eigen::MatrixXd V0 = result.V;
+            result.saveSurfaceMesh(fmt::format("{}lineSearch-{:05d}-t0.obj", outputFolderPath, count));
+            stepForward(V0, result, alpha_feasible);
+            result.saveSurfaceMesh(fmt::format("{}lineSearch-{:05d}-tα={:g}.obj", outputFolderPath, count, alpha_feasible));
+            stepForward(V0, result, 1);
+            result.saveSurfaceMesh(fmt::format("{}lineSearch-{:05d}-t1.obj", outputFolderPath, count));
+            result.V = V0;
+            count++;
+        }
+#endif
         lineSearch(alpha);
         if (alpha_feasible < 1.0e-8) {
             logFile << "tiny feasible step size " << alpha_feasible << " " << alpha << std::endl;
@@ -1978,7 +2200,7 @@ bool Optimizer<dim>::solveSub_IP(double mu, std::vector<std::vector<int>>& AHat,
 
             saveStatus("tinyStepSize");
             useGD = true;
-            // // mu_IP *= 1.1;
+            // // kappa *= 1.1;
             // if constexpr (dim == 3) {
             //     spdlog::info("check EE pairs:");
             //     for (const auto cI : MMActiveSet.back()) {
@@ -2055,34 +2277,35 @@ bool Optimizer<dim>::solveSub_IP(double mu, std::vector<std::vector<int>>& AHat,
 
     if (k >= iterCap) {
         logFile << "iteration cap reached for IP subproblem solve!!!" << std::endl;
+        spdlog::error("iteration cap reached for IP subproblem solve!!!");
         exit(0); // for stopping comparative schemes that can potentially not converge
     }
 
     return true;
-} // namespace IPC
+}
 
 template <int dim>
-void Optimizer<dim>::upperBoundMu(double& mu)
+void Optimizer<dim>::upperBoundKappa(double& kappa)
 {
     double H_b;
     compute_H_b(1.0e-16 * bboxDiagSize2, dHat, H_b);
-    double muMax = 1.0e13 * result.avgNodeMass(dim) / (4.0e-16 * bboxDiagSize2 * H_b);
-    if (mu > muMax) {
-        mu = muMax;
-        logFile << "upper bounded mu to " << muMax << " at dHat = " << dHat << std::endl;
+    double kappaMax = 100 * animConfig.kappaMinMultiplier * result.avgNodeMass(dim) / (4.0e-16 * bboxDiagSize2 * H_b);
+    if (kappa > kappaMax) {
+        kappa = kappaMax;
+        logFile << "upper bounded kappa to " << kappaMax << " at dHat = " << dHat << std::endl;
     }
 }
 
 template <int dim>
-void Optimizer<dim>::suggestMu(double& mu)
+void Optimizer<dim>::suggestKappa(double& kappa)
 {
     double H_b;
     compute_H_b(1.0e-16 * bboxDiagSize2, dHat, H_b);
-    mu = 1.0e11 * result.avgNodeMass(dim) / (4.0e-16 * bboxDiagSize2 * H_b);
+    kappa = animConfig.kappaMinMultiplier * result.avgNodeMass(dim) / (4.0e-16 * bboxDiagSize2 * H_b);
 }
 
 template <int dim>
-void Optimizer<dim>::initMu_IP(double& mu)
+void Optimizer<dim>::initKappa(double& kappa)
 {
     //TODO: optimize implementation and pipeline
     buildConstraintStartIndsWithMM(activeSet, MMActiveSet, constraintStartInds);
@@ -2121,42 +2344,43 @@ void Optimizer<dim>::initMu_IP(double& mu)
             SelfCollisionHandler<dim>::leftMultiplyConstraintJacobianT(result, MMActiveSet.back(),
                 constraintVal.segment(startCI, MMActiveSet.back().size()), g_c);
         }
-        for (const auto& fixedVI : result.fixedVert) {
-            g_c.segment<dim>(fixedVI * dim).setZero();
+        for (const auto& vI : result.DBCVertexIds) {
+            g_c.segment<dim>(vI * dim).setZero();
         }
 
         // balance current gradient at constrained DOF
-        double mu_trial = -g_c.dot(g_E) / g_c.squaredNorm();
-        if (mu_trial > 0.0) {
-            mu = mu_trial;
+        double minKappa = -g_c.dot(g_E) / g_c.squaredNorm();
+        if (minKappa > 0.0) {
+            kappa = minKappa;
         }
-        suggestMu(mu_trial);
-        if (mu < mu_trial) {
-            mu = mu_trial;
+        suggestKappa(minKappa);
+        spdlog::info("kappa_min = {:g} kappa_max = {:g}", minKappa, 100 * minKappa);
+        if (kappa < minKappa) {
+            kappa = minKappa;
         }
-        upperBoundMu(mu);
+        upperBoundKappa(kappa);
 
         // minimize approximated next search direction
         //            Eigen::VectorXd HInvGc, HInvGE;
         //            linSysSolver->solve(g_c, HInvGc);
         //            linSysSolver->solve(g_E, HInvGE);
-        //            mu = HInvGE.dot(HInvGc) / HInvGc.squaredNorm();
-        //            if(mu < 0.0) {
-        //                mu = g_c.dot(g_E) / g_c.squaredNorm();
+        //            kappa = HInvGE.dot(HInvGc) / HInvGc.squaredNorm();
+        //            if(kappa < 0.0) {
+        //                kappa = g_c.dot(g_E) / g_c.squaredNorm();
         //            }
 
         // minimize approximated next search direction at constrained DOF
         //            Eigen::VectorXd HInvGc;
         //            linSysSolver->solve(g_c, HInvGc);
-        //            mu = g_E.dot(HInvGc) / g_c.dot(HInvGc);
-        //            if(mu < 0.0) {
-        //                mu = g_c.dot(g_E) / g_c.squaredNorm();
+        //            kappa = g_E.dot(HInvGc) / g_c.dot(HInvGc);
+        //            if(kappa < 0.0) {
+        //                kappa = g_c.dot(g_E) / g_c.squaredNorm();
         //            }
 
-        spdlog::info("mu initialized to {:g}", mu);
+        spdlog::info("kappa initialized to {:g}", kappa);
     }
     else {
-        spdlog::info("no constraint detected, start with default mu");
+        spdlog::info("no constraint detected, start with default kappa");
     }
 }
 
@@ -2204,23 +2428,23 @@ void Optimizer<dim>::computeSearchDir(int k, bool projectDBC)
 template <int dim>
 void Optimizer<dim>::postLineSearch(double alpha)
 {
-#ifdef ADAPTIVE_MU
-    if (mu_IP == 0.0) {
-        initMu_IP(mu_IP);
+#ifdef ADAPTIVE_KAPPA
+    if (kappa == 0.0) {
+        initKappa(kappa);
     }
     else {
         //TODO: avoid recomputation of constraint functions
-        bool updateMu = false;
+        bool updateKappa = false;
         for (int i = 0; i < closeConstraintID.size(); ++i) {
             double d;
             animConfig.collisionObjects[closeConstraintID[i].first]->evaluateConstraint(result,
                 closeConstraintID[i].second, d);
             if (d <= closeConstraintVal[i]) {
-                updateMu = true;
+                updateKappa = true;
                 break;
             }
         }
-        if (!updateMu) {
+        if (!updateKappa) {
             for (int i = 0; i < closeMConstraintID.size(); ++i) {
                 double d;
                 if (closeMConstraintID[i].first < animConfig.meshCollisionObjects.size()) {
@@ -2231,18 +2455,18 @@ void Optimizer<dim>::postLineSearch(double alpha)
                     SelfCollisionHandler<dim>::evaluateConstraint(result, closeMConstraintID[i].second, d);
                 }
                 if (d <= closeMConstraintVal[i]) {
-                    updateMu = true;
+                    updateKappa = true;
                     break;
                 }
             }
         }
-        if (updateMu) {
-            mu_IP *= 2.0;
-            upperBoundMu(mu_IP);
+        if (updateKappa) {
+            kappa *= 2.0;
+            upperBoundKappa(kappa);
         }
 #endif
 
-#ifdef ADAPTIVE_MU
+#ifdef ADAPTIVE_KAPPA
         closeConstraintID.resize(0);
         closeMConstraintID.resize(0);
         closeConstraintVal.resize(0);
@@ -2526,7 +2750,7 @@ bool Optimizer<dim>::lineSearch(double& stepSize,
     }
     else {
         timer_step.start(9);
-        computeEnergyVal(result, false, lastEnergyVal); //TODO: only for updated constraints set and mu
+        computeEnergyVal(result, false, lastEnergyVal); //TODO: only for updated constraints set and kappa
         timer_step.start(5);
     }
     msg << "E_last = " << lastEnergyVal << " stepSize: " << stepSize << " -> ";
@@ -2549,7 +2773,7 @@ bool Optimizer<dim>::lineSearch(double& stepSize,
 
 #ifdef OUTPUT_CCD_FAIL
     bool output = false;
-    if (solveIP && animConfig.exactCCDMethod != ExactCCD::Method::NONE) {
+    if (solveIP && animConfig.ccdMethod != ccd::CCDMethod::FLOATING_POINT_ROOT_FINDER) {
         result.saveSurfaceMesh(outputFolderPath + "before" + std::to_string(numOfCCDFail) + ".obj");
         output = true;
     }
@@ -2664,7 +2888,7 @@ bool Optimizer<dim>::lineSearch(double& stepSize,
     result.V = resultV0;
     sh.build(result, searchDir, stepSize, result.avgEdgeLen / 3.0);
     double stepSize_rational = stepSize;
-    SelfCollisionHandler<dim>::largestFeasibleStepSize_CCD_exact(result, sh, searchDir, ExactCCD::Method::RATIONAL_ROOT_PARITY, stepSize_rational);
+    SelfCollisionHandler<dim>::largestFeasibleStepSize_CCD_exact(result, sh, searchDir, ccd::CCDMethod::RATIONAL_ROOT_PARITY, stepSize_rational);
     if (stepSize_rational != stepSize) {
         std::cout << "rational CCD detects interpenetration but inexact didn't" << std::endl;
     }
@@ -2811,41 +3035,54 @@ void Optimizer<dim>::initStepSize(const Mesh<dim>& data, double& stepSize)
 template <int dim>
 void Optimizer<dim>::saveStatus(const std::string& appendStr)
 {
-    FILE* out = fopen((outputFolderPath + "status" + std::to_string(globalIterNum) + appendStr).c_str(), "w");
-    assert(out);
+    std::string status_fname = fmt::format("{}status{:d}{}", outputFolderPath, globalIterNum, appendStr);
+    std::ofstream status(status_fname, std::ios::out);
+    if (status.is_open()) {
+        // status << std::hexfloat;
+        status << std::setprecision(std::numeric_limits<long double>::digits10 + 2);
 
-    fprintf(out, "timestep %d\n", globalIterNum);
+        status << "timestep " << globalIterNum << "\n\n";
 
-    fprintf(out, "\nposition %ld %ld\n", result.V.rows(), result.V.cols());
-    for (int vI = 0; vI < result.V.rows(); ++vI) {
-        fprintf(out, "%le %le", result.V(vI, 0),
-            result.V(vI, 1));
-        if constexpr (dim == 3) {
-            fprintf(out, " %le\n", result.V(vI, 2));
+        status << "position " << result.V.rows() << " " << result.V.cols() << "\n";
+        for (int vI = 0; vI < result.V.rows(); ++vI) {
+            status << result.V(vI, 0) << " " << result.V(vI, 1);
+            if constexpr (dim == 3) {
+                status << " " << result.V(vI, 2);
+            }
+            status << "\n";
         }
-        else {
-            fprintf(out, "\n");
+        status << "\n";
+
+        status << "velocity " << velocity.size() << "\n";
+        for (int velI = 0; velI < velocity.size(); ++velI) {
+            status << velocity[velI] << "\n";
         }
+        status << "\n";
+
+        status << "acceleration " << acceleration.rows() << " " << dim << "\n";
+        for (int accI = 0; accI < acceleration.rows(); ++accI) {
+            status << acceleration(accI, 0) << " " << acceleration(accI, 1);
+            if constexpr (dim == 3) {
+                status << " " << acceleration(accI, 2);
+            }
+            status << "\n";
+        }
+        status << "\n";
+
+        status << "dx_Elastic " << dx_Elastic.rows() << " " << dim << "\n";
+        for (int velI = 0; velI < dx_Elastic.rows(); ++velI) {
+            status << dx_Elastic(velI, 0) << " " << dx_Elastic(velI, 1);
+            if constexpr (dim == 3) {
+                status << " " << dx_Elastic(velI, 2);
+            }
+            status << "\n";
+        }
+
+        status.close();
     }
-
-    fprintf(out, "\nvelocity %ld\n", velocity.size());
-    for (int velI = 0; velI < velocity.size(); ++velI) {
-        fprintf(out, "%le\n", velocity[velI]);
+    else {
+        spdlog::error("Unable to create status file ({})!", status_fname);
     }
-
-    fprintf(out, "\ndx_Elastic %ld %d\n", dx_Elastic.rows(), dim);
-    for (int velI = 0; velI < dx_Elastic.rows(); ++velI) {
-        fprintf(out, "%le %le", dx_Elastic(velI, 0),
-            dx_Elastic(velI, 1));
-        if constexpr (dim == 3) {
-            fprintf(out, " %le\n", dx_Elastic(velI, 2));
-        }
-        else {
-            fprintf(out, "\n");
-        }
-    }
-
-    fclose(out);
 
     // surface mesh, including codimensional surface CO
 #ifdef USE_TBB
@@ -2860,7 +3097,7 @@ void Optimizer<dim>::saveStatus(const std::string& appendStr)
     );
 #endif
 
-    igl::writeOBJ(outputFolderPath + std::to_string(globalIterNum) + ".obj", V_surf, F_surf);
+    igl::writeOBJ(outputFolderPath + std::to_string(globalIterNum) + ".obj", V_surf.rowwise() + invShift.transpose(), F_surf);
 
     // codimensional segment CO
     if (result.CE.rows()) {
@@ -2964,9 +3201,12 @@ void Optimizer<dim>::computeEnergyVal(const Mesh<dim>& data, int redoSVD, double
     energyVal += energyVals.sum();
 
     if (animScripter.isNBCActive()) {
-        for (const auto& NMI : data.NeumannBC) {
-            if (!data.isFixedVert[NMI.first]) {
-                energyVal -= dtSq * data.massMatrix.coeff(NMI.first, NMI.first) * data.V.row(NMI.first).dot(NMI.second);
+        for (int NBCi = 0; NBCi < data.NeumannBCs.size(); NBCi++) {
+            const auto& NBC = data.NeumannBCs[NBCi];
+            for (const auto& vI : NBC.vertIds) {
+                if (!data.isDBCVertex(vI) && animScripter.isNBCActive(data, NBCi)) {
+                    energyVal -= dtSq * data.massMatrix.coeff(vI, vI) * data.V.row(vI).dot(NBC.force.transpose());
+                }
             }
         }
     }
@@ -3072,9 +3312,9 @@ void Optimizer<dim>::computeEnergyVal(const Mesh<dim>& data, int redoSVD, double
                 }
             }
         }
-        energyVal += mu_IP * bVals.sum();
-        // std::cout << ", E_c=" << mu_IP * bVals.sum();
-        // energies[1] = mu_IP * bVals.sum();
+        energyVal += kappa * bVals.sum();
+        // std::cout << ", E_c=" << kappa * bVals.sum();
+        // energies[1] = kappa * bVals.sum();
 
         for (int coI = 0; coI < animConfig.collisionObjects.size(); ++coI) {
             // friction
@@ -3113,8 +3353,8 @@ void Optimizer<dim>::computeEnergyVal(const Mesh<dim>& data, int redoSVD, double
 #ifdef USE_TBB
         );
 #endif
-        for (const auto& fixedVI : data.fixedVert) {
-            displacement.segment<dim>(fixedVI * dim).setZero();
+        for (const auto& vI : data.DBCVertexIds) {
+            displacement.segment<dim>(vI * dim).setZero();
         }
 
         dampingMtr->multiply(displacement, Adx);
@@ -3163,7 +3403,7 @@ void Optimizer<dim>::computeGradient(const Mesh<dim>& data,
     for (int vI = 0; vI < data.V.rows(); vI++)
 #endif
         {
-            if (!data.isFixedVert[vI] || !projectDBC) {
+            if (!data.isProjectDBCVertex(vI, projectDBC)) {
                 gradient.segment<dim>(vI * dim) += (data.massMatrix.coeff(vI, vI) * (data.V.row(vI) - xTilta.row(vI)).transpose());
             }
         }
@@ -3172,9 +3412,12 @@ void Optimizer<dim>::computeGradient(const Mesh<dim>& data,
 #endif
 
     if (animScripter.isNBCActive()) {
-        for (const auto& NMI : data.NeumannBC) {
-            if (!data.isFixedVert[NMI.first]) {
-                gradient.template segment<dim>(NMI.first * dim) -= dtSq * data.massMatrix.coeff(NMI.first, NMI.first) * NMI.second.transpose();
+        for (int NBCi = 0; NBCi < data.NeumannBCs.size(); NBCi++) {
+            const auto& NBC = data.NeumannBCs[NBCi];
+            for (const auto& vI : NBC.vertIds) {
+                if (!data.isDBCVertex(vI) && animScripter.isNBCActive(data, NBCi)) {
+                    gradient.template segment<dim>(vI * dim) -= dtSq * data.massMatrix.coeff(vI, vI) * NBC.force;
+                }
             }
         }
     }
@@ -3188,7 +3431,7 @@ void Optimizer<dim>::computeGradient(const Mesh<dim>& data,
                 compute_g_b(constraintVal[cI], dHat, constraintVal[cI]);
             }
             animConfig.collisionObjects[coI]->leftMultiplyConstraintJacobianT(data, activeSet[coI],
-                constraintVal.segment(startCI, activeSet[coI].size()), gradient, mu_IP);
+                constraintVal.segment(startCI, activeSet[coI].size()), gradient, kappa);
 
             // friction
             if (activeSet_lastH[coI].size() && fricDHat > 0.0 && animConfig.collisionObjects[coI]->friction > 0.0) {
@@ -3203,10 +3446,10 @@ void Optimizer<dim>::computeGradient(const Mesh<dim>& data,
                 compute_g_b(constraintVal[cI], dHat, constraintVal[cI]);
             }
             animConfig.meshCollisionObjects[coI]->leftMultiplyConstraintJacobianT(data, MMActiveSet[coI],
-                constraintVal.segment(startCI, MMActiveSet[coI].size()), gradient, mu_IP);
+                constraintVal.segment(startCI, MMActiveSet[coI].size()), gradient, kappa);
 
             animConfig.meshCollisionObjects[coI]->augmentParaEEGradient(data,
-                paraEEMMCVIDSet[coI], paraEEeIeJSet[coI], gradient, dHat, mu_IP);
+                paraEEMMCVIDSet[coI], paraEEeIeJSet[coI], gradient, dHat, kappa);
         }
         if (animConfig.isSelfCollision) {
             int startCI = constraintVal.size();
@@ -3215,19 +3458,25 @@ void Optimizer<dim>::computeGradient(const Mesh<dim>& data,
                 compute_g_b(constraintVal[cI], dHat, constraintVal[cI]);
             }
             SelfCollisionHandler<dim>::leftMultiplyConstraintJacobianT(data, MMActiveSet.back(),
-                constraintVal.segment(startCI, MMActiveSet.back().size()), gradient, mu_IP);
+                constraintVal.segment(startCI, MMActiveSet.back().size()), gradient, kappa);
 
             SelfCollisionHandler<dim>::augmentParaEEGradient(data,
-                paraEEMMCVIDSet.back(), paraEEeIeJSet.back(), gradient, dHat, mu_IP);
+                paraEEMMCVIDSet.back(), paraEEeIeJSet.back(), gradient, dHat, kappa);
 
             if (MMActiveSet_lastH.back().size() && fricDHat > 0.0 && animConfig.selfFric > 0.0) {
                 SelfCollisionHandler<dim>::augmentFrictionGradient(data.V, result.V_prev, MMActiveSet_lastH.back(),
                     MMLambda_lastH.back(), MMDistCoord.back(), MMTanBasis.back(), gradient, fricDHat, animConfig.selfFric);
+#ifdef EXPORT_FRICTION_DATA
+                save_friction_data(
+                    data, MMActiveSet_lastH.back(), MMLambda_lastH.back(),
+                    MMDistCoord.back(), MMTanBasis.back(),
+                    dHat, kappa, fricDHat, animConfig.selfFric);
+#endif
             }
         }
-        if (projectDBC) {
-            for (const auto& fixedVI : data.fixedVert) {
-                gradient.segment<dim>(fixedVI * dim).setZero();
+        for (const auto& vI : data.DBCVertexIds) {
+            if (data.isProjectDBCVertex(vI, projectDBC)) {
+                gradient.segment<dim>(vI * dim).setZero();
             }
         }
     }
@@ -3245,9 +3494,9 @@ void Optimizer<dim>::computeGradient(const Mesh<dim>& data,
 #ifdef USE_TBB
         );
 #endif
-        if (projectDBC) {
-            for (const auto& fixedVI : data.fixedVert) {
-                displacement.segment<dim>(fixedVI * dim).setZero();
+        for (const auto& vI : data.DBCVertexIds) {
+            if (data.isProjectDBCVertex(vI, projectDBC)) {
+                displacement.segment<dim>(vI * dim).setZero();
             }
         }
 
@@ -3287,7 +3536,7 @@ void Optimizer<dim>::computePrecondMtr(const Mesh<dim>& data,
                 timer_mt.start(8);
                 vNeighbor_IP = vNeighbor_IP_new;
                 timer_mt.start(9);
-                p_linSysSolver->set_pattern(vNeighbor_IP, data.fixedVert);
+                p_linSysSolver->set_pattern(vNeighbor_IP, data.DBCVertexIds);
                 timer_mt.stop();
 
                 timer_step.start(2);
@@ -3300,7 +3549,7 @@ void Optimizer<dim>::computePrecondMtr(const Mesh<dim>& data,
             timer_mt.start(8);
             vNeighbor_IP = data.vNeighbor;
             timer_mt.start(9);
-            p_linSysSolver->set_pattern(vNeighbor_IP, data.fixedVert);
+            p_linSysSolver->set_pattern(vNeighbor_IP, data.DBCVertexIds);
             timer_mt.stop();
 
             timer_step.start(2);
@@ -3356,7 +3605,7 @@ void Optimizer<dim>::computePrecondMtr(const Mesh<dim>& data,
     for (int vI = 0; vI < data.V.rows(); vI++)
 #endif
         {
-            if (!data.isFixedVert[vI] || !projectDBC) {
+            if (!data.isProjectDBCVertex(vI, projectDBC)) {
                 double massI = data.massMatrix.coeff(vI, vI);
                 int ind0 = vI * dim;
                 int ind1 = ind0 + 1;
@@ -3388,7 +3637,7 @@ void Optimizer<dim>::computePrecondMtr(const Mesh<dim>& data,
         timer_mt.start(12);
         for (int coI = 0; coI < animConfig.collisionObjects.size(); ++coI) {
             animConfig.collisionObjects[coI]->augmentIPHessian(data,
-                activeSet[coI], p_linSysSolver, dHat, mu_IP, projectDBC);
+                activeSet[coI], p_linSysSolver, dHat, kappa, projectDBC);
 
             // friction
             if (activeSet_lastH[coI].size() && fricDHat > 0.0 && animConfig.collisionObjects[coI]->friction > 0.0) {
@@ -3399,17 +3648,17 @@ void Optimizer<dim>::computePrecondMtr(const Mesh<dim>& data,
         }
         timer_mt.start(13);
         for (int coI = 0; coI < animConfig.meshCollisionObjects.size(); ++coI) {
-            animConfig.meshCollisionObjects[coI]->augmentIPHessian(data, MMActiveSet[coI], p_linSysSolver, dHat, mu_IP, projectDBC);
+            animConfig.meshCollisionObjects[coI]->augmentIPHessian(data, MMActiveSet[coI], p_linSysSolver, dHat, kappa, projectDBC);
 
             animConfig.meshCollisionObjects[coI]->augmentParaEEHessian(data, paraEEMMCVIDSet[coI], paraEEeIeJSet[coI],
-                p_linSysSolver, dHat, mu_IP, projectDBC);
+                p_linSysSolver, dHat, kappa, projectDBC);
         }
         timer_mt.start(14);
         if (animConfig.isSelfCollision) {
-            SelfCollisionHandler<dim>::augmentIPHessian(data, MMActiveSet.back(), p_linSysSolver, dHat, mu_IP, projectDBC);
+            SelfCollisionHandler<dim>::augmentIPHessian(data, MMActiveSet.back(), p_linSysSolver, dHat, kappa, projectDBC);
 
             SelfCollisionHandler<dim>::augmentParaEEHessian(data, paraEEMMCVIDSet.back(), paraEEeIeJSet.back(),
-                p_linSysSolver, dHat, mu_IP, projectDBC);
+                p_linSysSolver, dHat, kappa, projectDBC);
 
             if (MMActiveSet_lastH.back().size() && fricDHat > 0.0 && animConfig.selfFric > 0.0) {
                 SelfCollisionHandler<dim>::augmentFrictionHessian(data, result.V_prev, MMActiveSet_lastH.back(),
@@ -3430,9 +3679,9 @@ void Optimizer<dim>::computePrecondMtr(const Mesh<dim>& data,
 
     if (!mute) { timer_step.stop(); }
     // output matrix and exit
-    //        IglUtils::writeSparseMatrixToFile("/Users/mincli/Desktop/IPC/output/A", p_linSysSolver, true);
-    //        std::cout << "matrix written" << std::endl;
-    //        exit(0);
+    // IglUtils::writeSparseMatrixToFile("/Users/mincli/Desktop/IPC/output/A", p_linSysSolver, true);
+    // std::cout << "matrix written" << std::endl;
+    // exit(0);
 }
 
 template <int dim>
@@ -3454,7 +3703,7 @@ void Optimizer<dim>::setupDampingMtr(const Mesh<dim>& data,
     bool redoSVD,
     LinSysSolver<Eigen::VectorXi, Eigen::VectorXd>* p_dampingMtr)
 {
-    dampingMtr->set_pattern(data.vNeighbor, data.fixedVert);
+    dampingMtr->set_pattern(data.vNeighbor, data.DBCVertexIds);
     computeDampingMtr(data, redoSVD, p_dampingMtr);
 }
 
@@ -3520,8 +3769,8 @@ void Optimizer<dim>::checkGradient(void)
             spdlog::info("{:d}/{:d} vertices computed", vI + 1, result.V.rows());
         }
     }
-    for (const auto fixedVI : result.fixedVert) {
-        gradient_finiteDiff.segment<dim>(dim * fixedVI).setZero();
+    for (const auto vI : result.DBCVertexIds) {
+        gradient_finiteDiff.segment<dim>(dim * vI).setZero();
     }
 
     Eigen::VectorXd gradient_symbolic;
@@ -3555,7 +3804,7 @@ void Optimizer<dim>::checkHessian(void)
     Eigen::SparseMatrix<double> hessian_finiteDiff;
     hessian_finiteDiff.resize(result.V.rows() * dim, result.V.rows() * dim);
     for (int vI = 0; vI < result.V.rows(); vI++) {
-        if (result.fixedVert.find(vI) != result.fixedVert.end()) {
+        if (result.DBCVertexIds.find(vI) != result.DBCVertexIds.end()) {
             hessian_finiteDiff.insert(vI * dim, vI * dim) = 1.0;
             hessian_finiteDiff.insert(vI * dim + 1, vI * dim + 1) = 1.0;
             if constexpr (dim == 3) {
@@ -3573,7 +3822,7 @@ void Optimizer<dim>::checkHessian(void)
             Eigen::VectorXd hessian_colI = (gradient_perturbed - gradient0) / h;
             int colI = vI * dim + dimI;
             for (int rowI = 0; rowI < result.V.rows() * dim; rowI++) {
-                if ((result.fixedVert.find(rowI / dim) == result.fixedVert.end()) && (hessian_colI[rowI] != 0.0)) {
+                if (result.DBCVertexIds.find(rowI / dim) == result.DBCVertexIds.end() && hessian_colI[rowI] != 0.0) {
                     hessian_finiteDiff.insert(rowI, colI) = hessian_colI[rowI];
                 }
             }
@@ -3593,7 +3842,7 @@ void Optimizer<dim>::checkHessian(void)
 #else
     linSysSolver = new EigenLibSolver<Eigen::VectorXi, Eigen::VectorXd>();
 #endif
-    linSysSolver->set_pattern(result.vNeighbor, result.fixedVert);
+    linSysSolver->set_pattern(result.vNeighbor, result.DBCVertexIds);
     computeConstraintSets(result);
     computePrecondMtr(result, true, linSysSolver);
     linSysSolver->getCoeffMtr(hessian_symbolicPK);

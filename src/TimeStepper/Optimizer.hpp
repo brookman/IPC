@@ -65,7 +65,7 @@ protected: // owned data
     std::vector<Eigen::VectorXd> lambda_lastH;
 
     bool solveIP, solveFric;
-    double mu_IP, dHatEps, dHat;
+    double kappa, dHatEps, dHat;
     double fbNormTol, bboxDiagSize2, dTolRel, dTol, dHatTarget;
     double fricDHat, fricDHatThres, fricDHat0, fricDHatTarget;
     std::vector<std::vector<MMCVID>> MMActiveSet, MMActiveSet_next;
@@ -139,9 +139,11 @@ public: // API
     virtual void getFaceFieldForVis(Eigen::VectorXd& field);
     virtual Mesh<dim>& getResult(void);
     virtual int getIterNum(void) const;
+    virtual int getFrameAmt(void) const;
     virtual int getInnerIterAmt(void) const;
     virtual void setRelGL2Tol(double p_relTol = 1.0e-2);
     virtual double getDt(void) const;
+    virtual const AnimScripter<dim>& getAnimScripter() const;
     virtual void setAnimScriptType(AnimScriptType animScriptType,
         const std::string& meshSeqFolderPath);
 
@@ -170,7 +172,7 @@ protected: // helper functions
     /// @brief Compute the QP inequality constraints \f$Ax \geq b\f$
     virtual void computeQPInequalityConstraint(
         const Mesh<dim>& mesh,
-        const std::vector<CollisionObject<dim>*>& collisionObjects,
+        const std::vector<std::shared_ptr<CollisionObject<dim>>>& collisionObjects,
         const std::vector<std::vector<int>>& activeSet,
         const int num_vars,
         std::vector<int>& constraintStartInds,
@@ -179,7 +181,7 @@ protected: // helper functions
     /// @brief Solve the QP of the objective and collision constraints.
     virtual bool solveQP(
         const Mesh<dim>& mesh,
-        const std::vector<CollisionObject<dim>*>& collisionObjects,
+        const std::vector<std::shared_ptr<CollisionObject<dim>>>& collisionObjects,
         const std::vector<std::vector<int>>& activeSet,
         const LinSysSolver<Eigen::VectorXi, Eigen::VectorXd>* linSys,
         Eigen::SparseMatrix<double>& P,
@@ -208,7 +210,7 @@ protected: // helper functions
 #endif
 
     virtual void computeQPResidual(const Mesh<dim>& mesh,
-        const std::vector<CollisionObject<dim>*>& collisionObjects,
+        const std::vector<std::shared_ptr<CollisionObject<dim>>>& collisionObjects,
         const std::vector<std::vector<int>>& activeSet,
         const std::vector<int>& constraintStartInds,
         const Eigen::VectorXd& gradient,
@@ -223,11 +225,11 @@ protected: // helper functions
     virtual bool fullyImplicit(void);
     virtual bool fullyImplicit_IP(void);
 
-    virtual bool solveSub_IP(double mu, std::vector<std::vector<int>>& AHat,
+    virtual bool solveSub_IP(double kappa, std::vector<std::vector<int>>& AHat,
         std::vector<std::vector<MMCVID>>& MMAHat);
-    virtual void initMu_IP(double& mu);
-    virtual void upperBoundMu(double& mu);
-    virtual void suggestMu(double& mu);
+    virtual void initKappa(double& kappa);
+    virtual void upperBoundKappa(double& kappa);
+    virtual void suggestKappa(double& kappa);
 
     virtual void initSubProb_IP(void);
     virtual void computeSearchDir(int k, bool projectDBC = true);

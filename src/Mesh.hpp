@@ -20,6 +20,41 @@
 
 namespace IPC {
 
+struct DirichletBC {
+    DirichletBC(const std::vector<int>& vertIds,
+        const Eigen::Vector3d& linearVelocity,
+        const Eigen::Vector3d& angularVelocity,
+        const std::array<double, 2>& timeRange = { 0.0, std::numeric_limits<double>::infinity() })
+        : vertIds(vertIds), linearVelocity(linearVelocity), angularVelocity(angularVelocity), timeRange(timeRange) {}
+
+    bool isZero() const
+    {
+        return linearVelocity.isZero() && angularVelocity.isZero();
+    }
+
+    std::vector<int> vertIds;
+    Eigen::Vector3d linearVelocity;
+    Eigen::Vector3d angularVelocity;
+    std::array<double, 2> timeRange = { 0.0, std::numeric_limits<double>::infinity() };
+};
+
+enum class DirichletBCType {
+    NOT_DBC = 0,
+    ZERO = 1,
+    NONZERO = 2
+};
+
+struct NeumannBC {
+    NeumannBC(const std::vector<int>& vertIds,
+        const Eigen::Vector3d& force,
+        const std::array<double, 2>& timeRange = { 0.0, std::numeric_limits<double>::infinity() })
+        : vertIds(vertIds), force(force), timeRange(timeRange) {}
+
+    std::vector<int> vertIds;
+    Eigen::Vector3d force;
+    std::array<double, 2> timeRange = { 0.0, std::numeric_limits<double>::infinity() };
+};
+
 template <int dim>
 class Mesh {
 public: // owned data
@@ -40,7 +75,8 @@ public: // owned data
     std::vector<std::pair<Eigen::Vector3i, Eigen::Vector3d>> componentLVels; ///< @brief scripted linear velocity if any of each loaded component [compI, startElemI, endElemI, density, E, nu]
     std::vector<std::pair<Eigen::Vector3i, Eigen::Vector3d>> componentAVels; ///< @brief scripted angular velocity if any of each loaded component [compI, startElemI, endElemI, density, E, nu]
     std::vector<std::pair<Eigen::Vector3i, std::array<Eigen::Vector3d, 2>>> componentInitVels; ///< @brief initial linear and angular velocity for any of each loaded component [compI, startElemI, endElemI, density, E, nu]
-    std::vector<std::pair<std::vector<int>, std::array<Eigen::Vector3d, 2>>> DBCInfo;
+    std::vector<DirichletBC> DirichletBCs;
+    std::vector<NeumannBC> NeumannBCs;
     std::vector<std::pair<int, std::string>> meshSeqFolderPath;
 
 public: // owned features
@@ -49,9 +85,8 @@ public: // owned features
     Eigen::VectorXd u, lambda;
     Eigen::VectorXd triArea; // triangle rest area
     double avgEdgeLen;
-    std::map<int, Eigen::Matrix<double, 1, dim>> NeumannBC;
-    std::set<int> fixedVert; // for linear solve
-    std::vector<bool> isFixedVert;
+    std::set<int> DBCVertexIds; // for linear solve
+    std::vector<DirichletBCType> vertexDBCType;
     Eigen::Matrix<double, 2, 3> bbox;
     std::vector<std::vector<int>> borderVerts_primitive;
     std::vector<Eigen::Matrix<double, dim, dim>> restTriInv;
@@ -81,18 +116,28 @@ public: // constructor
         const std::vector<std::pair<Eigen::Vector3i, Eigen::Vector3d>>& componentLVels,
         const std::vector<std::pair<Eigen::Vector3i, Eigen::Vector3d>>& componentAVels,
         const std::vector<std::pair<Eigen::Vector3i, std::array<Eigen::Vector3d, 2>>>& componentInitVels,
-        const std::vector<std::pair<std::vector<int>, std::array<Eigen::Vector3d, 2>>>& DBCInfo,
-        const std::map<int, Eigen::Matrix<double, 1, dim>>& NeumannBC,
+        const std::vector<DirichletBC>& DirichletBCs,
+        const std::vector<NeumannBC>& NeumannBCs,
         const std::vector<std::pair<int, std::string>>& meshSeqFolderPath,
         double YM, double PR, double rho);
 
 public: // API
     void computeMassMatrix(const igl::MassMatrixType type = igl::MASSMATRIX_TYPE_VORONOI);
-    void computeFeatures(bool multiComp = false, bool resetFixedV = false);
-    void resetFixedVert(const std::set<int>& p_fixedVert = std::set<int>());
-    void addFixedVert(int vI);
-    void addFixedVert(const std::vector<int>& p_fixedVert);
-    void removeFixedVert(int vI);
+    void computeFeatures(bool multiComp = false, bool resetDBCV = false);
+
+    void resetDBCVertices(const std::map<int, DirichletBCType>& p_DBCVert = std::map<int, DirichletBCType>());
+    void addDBCVertex(int vI, DirichletBCType type);
+    void addDBCVertices(const std::vector<int>& p_DBCVert, DirichletBCType type);
+    void addDBCVertices(const std::vector<std::pair<int, DirichletBCType>>& p_DBCVert);
+    void removeDBCVertex(int vI);
+
+    bool isDBCVertex(int vI) const { return vertexDBCType[vI] != DirichletBCType::NOT_DBC; }
+    bool isProjectDBCVertex(int vI, bool projectDBC) const
+    {
+        assert(vI < vertexDBCType.size());
+        return vertexDBCType[vI] == DirichletBCType::ZERO
+            || (vertexDBCType[vI] == DirichletBCType::NONZERO && projectDBC);
+    }
 
     double avgNodeMass(int coDim = -1) const;
     double matSpaceBBoxSize2(int coDim = -1) const;
@@ -112,7 +157,7 @@ public: // API
     void saveAsMesh(const std::string& filePath, bool scaleUV = false,
         const Eigen::MatrixXi& SF = Eigen::MatrixXi()) const;
 
-    void saveSurfaceMesh(const std::string& filePath) const;
+    void saveSurfaceMesh(const std::string& filePath, bool use_V_prev = false, bool useInvShift = true) const;
 
     void saveBCNodes(const std::string& filePath) const;
 

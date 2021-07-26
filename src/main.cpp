@@ -7,6 +7,7 @@
 #include "GIF.hpp"
 #include "Timer.hpp"
 #include "getRSS.hpp"
+#include "CCDUtils.hpp"
 
 #include <igl/readOBJ.h>
 #ifdef USE_OPENGL
@@ -19,14 +20,8 @@
 #include <fstream>
 #include <string>
 #include <ctime>
-#if __has_include(<filesystem>)
-#include <filesystem>
-namespace fs = std::filesystem;
-#else
-#include <experimental/filesystem>
-namespace fs = std::experimental::filesystem;
-#endif
 
+#include <ghc/fs_std.hpp> // filesystem
 #include <spdlog/spdlog.h>
 #include <CLI/CLI.hpp>
 
@@ -42,7 +37,6 @@ bool offlineMode = false;
 bool autoSwitch = false;
 bool contactHandling = false;
 bool optimization_on = false;
-bool show_lines = true;
 int iterNum = 0;
 int converged = 0;
 bool outerLoopFinished = false;
@@ -69,7 +63,12 @@ int showDistortion_init = showDistortion;
 Eigen::MatrixXd faceColors_default;
 bool showTexture = true; // show checkerboard
 bool isLighting = true;
-bool showFixedVerts = true;
+bool showZeroDirichletVerts = true;
+bool showNonzeroDirichletVerts = true;
+bool showNeumannVerts = true;
+Eigen::RowVector3d zeroDirichletVertsColor;
+Eigen::RowVector3d nonzeroDirichletVertsColor;
+Eigen::RowVector3d neumannVertsColor;
 
 std::vector<bool> isSurfNode;
 std::vector<int> tetIndToSurf;
@@ -103,14 +102,39 @@ void saveInfo(bool writePNG = true, bool writeGIF = true, int writeMesh = 1, dou
 void saveScreenshot(const std::string& filePath, double scale = 1.0, bool writeGIF = false, bool writePNG = true);
 void saveInfoForPresent(const std::string fileName = "info.txt", double save_dt = 1e-2);
 
+bool useProgressBar = true;
+void printProgressBar(
+    int cur_iter,
+    int max_iter,
+    int bar_width = 70,
+    bool clear_end = false)
+{
+    float progress = std::max(0.0f, std::min(1.0f, cur_iter / float(max_iter)));
+    int pos = bar_width * progress;
+    int len = fmt::format("{:d}", max_iter).length();
+    fmt::print(
+        "{3:2d}%|{0:█>{1}}{0: >{2}}| {4: >{6}d}/{5:d}\r", //
+        "", pos, std::max(bar_width - pos, 0), int(progress * 100.0), cur_iter,
+        max_iter, len);
+    if (progress >= 1) {
+        if (clear_end) {
+            fmt::print("{0: {1}}", "", bar_width * 2);
+        }
+        else {
+            std::cout << std::endl;
+        }
+    }
+    std::cout.flush();
+}
+
 void proceedOptimization(int proceedNum = 1)
 {
     for (int proceedI = 0; (proceedI < proceedNum) && (!converged); proceedI++) {
         infoName = std::to_string(iterNum);
-        saveInfo(false, false, 3);
+        saveInfo(/*writePNG=*/false, /*writeGIF=*/false, /*writeMesh=*/3);
         if (!offlineMode) {
             // PNG and gif output only works under online rendering mode
-            saveInfo(false, true, false); // save gif
+            saveInfo(/*writePNG=*/false, /*writeGIF=*/true, /*writeMesh=*/false); // save gif
             if (savePNG) {
                 saveScreenshot(outputFolderPath + infoName + ".png",
                     1.0, false, true);
@@ -137,6 +161,10 @@ void proceedOptimization(int proceedNum = 1)
             logFile << "!!! maxIter reached for timeStep" << iterNum << std::endl;
         }
         iterNum = optimizer->getIterNum();
+
+        if (useProgressBar && !converged && spdlog::get_level() >= spdlog::level::level_enum::warn) {
+            printProgressBar(iterNum, optimizer->getFrameAmt());
+        }
 
         saveInfoForPresent("info" + std::to_string(iterNum) + ".txt");
 
@@ -248,10 +276,24 @@ void updateViewerData(void)
         }
 #endif
 
-        viewer.data().set_points(Eigen::MatrixXd::Zero(0, 3), Eigen::RowVector3d(0.0, 0.0, 0.0));
-        if (showFixedVerts) {
-            for (const auto& fixedVI : triSoup[viewChannel]->fixedVert) {
-                viewer.data().add_points(UV_vis.row(fixedVI), Eigen::RowVector3d(0.0, 0.0, 0.0));
+        viewer.data().set_points(Eigen::MatrixXd::Zero(0, 3), Eigen::RowVector3d::Zero());
+        for (const auto& vi : triSoup[viewChannel]->DBCVertexIds) {
+            if (showZeroDirichletVerts && triSoup[viewChannel]->vertexDBCType[vi] == IPC::DirichletBCType::ZERO) {
+                viewer.data().add_points(UV_vis.row(vi), zeroDirichletVertsColor);
+            }
+            else if (showNonzeroDirichletVerts && triSoup[viewChannel]->vertexDBCType[vi] == IPC::DirichletBCType::NONZERO) {
+                viewer.data().add_points(UV_vis.row(vi), nonzeroDirichletVertsColor);
+            }
+        }
+        if (showNeumannVerts && optimizer->getAnimScripter().isNBCActive()) {
+            int NBCi = 0;
+            for (const auto& NBC : triSoup[viewChannel]->NeumannBCs) {
+                if (optimizer->getAnimScripter().isNBCActive(*(triSoup[viewChannel]), NBCi)) {
+                    for (const auto& vi : NBC.vertIds) {
+                        viewer.data().add_points(UV_vis.row(vi), neumannVertsColor);
+                    }
+                }
+                NBCi++;
             }
         }
 
@@ -260,7 +302,7 @@ void updateViewerData(void)
         for (int ceI = 0; ceI < triSoup[viewChannel]->CE.rows(); ++ceI) {
             viewer.data().add_edges(triSoup[viewChannel]->V.row(triSoup[viewChannel]->CE(ceI, 0)),
                 triSoup[viewChannel]->V.row(triSoup[viewChannel]->CE(ceI, 1)),
-                Eigen::RowVector3d(0.0, 0.0, 0.0));
+                Eigen::RowVector3d::Zero());
         }
     }
     else {
@@ -287,10 +329,20 @@ void updateViewerData(void)
             viewer.core().lighting_factor = 0.0;
         }
 
-        viewer.data().set_points(Eigen::MatrixXd::Zero(0, 3), Eigen::RowVector3d(0.0, 0.0, 0.0));
-        if (showFixedVerts) {
-            for (const auto& fixedVI : triSoup[viewChannel]->fixedVert) {
-                viewer.data().add_points(V_vis.row(fixedVI), Eigen::RowVector3d(0.0, 0.0, 0.0));
+        viewer.data().set_points(Eigen::MatrixXd::Zero(0, 3), Eigen::RowVector3d::Zero());
+        for (const auto& vi : triSoup[viewChannel]->DBCVertexIds) {
+            if (showZeroDirichletVerts && triSoup[viewChannel]->vertexDBCType[vi] == IPC::DirichletBCType::ZERO) {
+                viewer.data().add_points(UV_vis.row(vi), zeroDirichletVertsColor);
+            }
+            else if (showNonzeroDirichletVerts && triSoup[viewChannel]->vertexDBCType[vi] == IPC::DirichletBCType::NONZERO) {
+                viewer.data().add_points(UV_vis.row(vi), nonzeroDirichletVertsColor);
+            }
+        }
+        if (showNeumannVerts) {
+            for (const auto& NBC : triSoup[viewChannel]->NeumannBCs) {
+                for (const auto& neumannVI : NBC.vertIds) {
+                    viewer.data().add_points(V_vis.row(neumannVI), neumannVertsColor);
+                }
             }
         }
     }
@@ -310,7 +362,7 @@ void saveScreenshot(const std::string& filePath, double scale, bool writeGIF, bo
     if (writeGIF) {
         scale = GIFScale;
     }
-    viewer.data().point_size = 5 * scale;
+    viewer.data().point_size *= scale;
 
     int width = static_cast<int>(scale * (viewer.core().viewport[2] - viewer.core().viewport[0]));
     int height = static_cast<int>(scale * (viewer.core().viewport[3] - viewer.core().viewport[1]));
@@ -343,7 +395,7 @@ void saveScreenshot(const std::string& filePath, double scale, bool writeGIF, bo
         GifWriteFrame(&GIFWriter, img.data(), width, height, GIFDelay);
     }
 
-    viewer.data().point_size = 5;
+    viewer.data().point_size /= scale;
 #endif
 }
 
@@ -458,6 +510,28 @@ void toggleOptimization(void)
 }
 
 #ifdef USE_OPENGL
+void printKeyboardHelp()
+{
+    std::cout << R"IPC_STRING(IPC viewer usage:
+  /             Toggle simulation
+  space         Take a single step
+  ctrl/cmd + s  Save screenshot and mesh of the current iteration
+  L,l           Toggle wireframe
+  T,t           Toggle filled faces
+  +,=           Increase point sizes by 1 pixel (+ shift by 10 pixels)
+  -,_           Decrease point sizes by 1 pixel (+ shift by 10 pixels)
+  O,o           Toggle orthographic/perspective projection
+  Z             Snap to canonical view
+  0             Show initial mesh
+  1             Show resulting mesh
+  U,u           Toggle UV
+  D,d           Toggle Distortion
+  A,a           Check gradient
+  H,h           Print this help menu
+  esc           Exit
+)IPC_STRING";
+}
+
 bool key_down(igl::opengl::glfw::Viewer& viewer, unsigned char key, int modifier)
 {
     if ((key >= '0') && (key <= '9')) {
@@ -466,7 +540,13 @@ bool key_down(igl::opengl::glfw::Viewer& viewer, unsigned char key, int modifier
             viewChannel = changeToChannel;
         }
     }
-    else {
+    else if ((key == 's' || key == 'S') && modifier & (IGL_MOD_CONTROL | IGL_MOD_SUPER)) {
+        infoName = std::to_string(iterNum);
+        saveInfo(/*writePNG=*/true, /*writeGIF=*/false, /*writeMesh=*/true);
+        spdlog::info("Saved screenshot to {}{}.png", outputFolderPath, infoName);
+        spdlog::info("Saved mesh to {}{}_mesh{}", outputFolderPath, infoName, (DIM == 2) ? ".obj" : ".msh");
+    }
+    else if (modifier == 0) {
         switch (key) {
         case ' ': {
             proceedOptimization();
@@ -476,13 +556,6 @@ bool key_down(igl::opengl::glfw::Viewer& viewer, unsigned char key, int modifier
 
         case '/': {
             toggleOptimization();
-            break;
-        }
-
-        case 'l':
-        case 'L': {
-            show_lines = !show_lines;
-            viewer.data().show_lines = show_lines;
             break;
         }
 
@@ -501,22 +574,45 @@ bool key_down(igl::opengl::glfw::Viewer& viewer, unsigned char key, int modifier
             break;
         }
 
-        case 'o':
-        case 'O': {
-            infoName = std::to_string(iterNum);
-            saveInfo(true, false, true);
-            break;
-        }
-
         case 'a':
         case 'A': {
             optimizer->checkGradient();
             break;
         }
 
+        case 'h':
+        case 'H': {
+            printKeyboardHelp();
+            break;
+        }
+
         default:
             break;
         }
+    }
+
+    updateViewerData();
+
+    return false;
+}
+
+bool key_pressed(igl::opengl::glfw::Viewer& viewer, unsigned char key, int modifier)
+{
+    switch (key) {
+    case '=':
+    case '+': {
+        viewer.data().point_size += modifier & IGL_MOD_SHIFT ? 10 : 1;
+        break;
+    }
+
+    case '-':
+    case '_': {
+        viewer.data().point_size = std::max(1.0f, viewer.data().point_size - (modifier & IGL_MOD_SHIFT ? 10 : 1));
+        break;
+    }
+
+    default:
+        break;
     }
 
     updateViewerData();
@@ -537,7 +633,7 @@ bool postDrawFunc()
 
     if (saveInfo_postDraw) {
         saveInfo_postDraw = false;
-        saveInfo(outerLoopFinished, true, outerLoopFinished);
+        saveInfo(/*writePNG=*/outerLoopFinished, /*writeGIF=*/true, /*writeMesh=*/outerLoopFinished);
         // Note that the content saved in the screenshots are depends on where updateViewerData() is called
         if (outerLoopFinished) {
             //            triSoup[channel_result]->saveAsMesh(outputFolderPath + infoName + "_mesh_01UV.obj", true);
@@ -627,6 +723,7 @@ struct CLIArgs {
     std::string folderTail = "";
     std::string outputDir = "";
     int logLevel = 0; // trace (all logs)
+    bool noProgressBar = false;
 };
 
 void init_cli_app(CLI::App& app, CLIArgs& args)
@@ -647,14 +744,19 @@ void init_cli_app(CLI::App& app, CLIArgs& args)
         "set log level (0=trace, 1=debug, 2=info, 3=warn, 4=error, 5=critical,"
         " 6=off)",
         true);
+    app.add_flag("--noProgressBar,--noPBar", args.noProgressBar,
+        "disable printing a progress bar");
 }
 
 int main(int argc, char* argv[])
 {
-#ifdef USE_TBB
-#ifdef TBB_NUM_THREADS
+    // initialize colors
+    igl::colormap(igl::COLOR_MAP_TYPE_VIRIDIS, 2.0 / 9.0, zeroDirichletVertsColor.data());
+    igl::colormap(igl::COLOR_MAP_TYPE_VIRIDIS, 4.0 / 9.0, nonzeroDirichletVertsColor.data());
+    igl::colormap(igl::COLOR_MAP_TYPE_VIRIDIS, 2.0 / 3.0, neumannVertsColor.data());
+
+#if defined(USE_TBB) && defined(TBB_NUM_THREADS)
     tbb::task_scheduler_init init(TBB_NUM_THREADS);
-#endif
 #endif
 
     CLI::App app{ "IPC" };
@@ -671,6 +773,8 @@ int main(int argc, char* argv[])
     if (args.logLevel == 6) {
         std::cout.setstate(std::ios_base::failbit);
     }
+
+    useProgressBar = !args.noProgressBar;
 
     switch (args.progMode) {
     case 0:
@@ -704,29 +808,21 @@ int main(int argc, char* argv[])
     }
 
     // Optimization mode
-    std::string meshFilePath;
-    if (args.inputFileName.at(0) == '/') {
-        spdlog::info("The input script file name is gloabl mesh file path.");
-        meshFilePath = args.inputFileName;
-        args.inputFileName = args.inputFileName.substr(args.inputFileName.find_last_of('/') + 1);
-    }
-    else {
-        meshFilePath = args.inputFileName;
-    }
-    std::string meshName = args.inputFileName.substr(0, args.inputFileName.find_last_of('.'));
+    const fs::path meshFilePath = fs::path(args.inputFileName);
+    const std::string meshName = meshFilePath.stem().string();
     // Load mesh
     Eigen::MatrixXd V, UV, N;
     Eigen::MatrixXi F, FUV, FN, E;
-    const std::string suffix = meshFilePath.substr(meshFilePath.find_last_of('.'));
+    const std::string suffix = meshFilePath.extension().string();
     bool loadSucceed = false;
     std::vector<std::vector<int>> borderVerts_primitive;
     std::vector<int> componentNodeRange, componentSFRange, componentCERange, componentCoDim;
     std::vector<std::pair<Eigen::Vector3i, Eigen::Vector3d>> componentMaterial, componentLVels, componentAVels;
     std::vector<std::pair<Eigen::Vector3i, std::array<Eigen::Vector3d, 2>>> componentInitVels;
-    std::vector<std::pair<std::vector<int>, std::array<Eigen::Vector3d, 2>>> DBCInfo;
-    std::map<int, Eigen::Matrix<double, 1, DIM>> NBCInfo;
+    std::vector<IPC::DirichletBC> DirichletBCs;
+    std::vector<IPC::NeumannBC> NeumannBCs;
     std::vector<std::pair<int, std::string>> meshSeqFolderPath;
-    if (suffix == ".txt") {
+    if (suffix == ".txt" || suffix == ".ipc") {
         loadSucceed = !config.loadFromFile(meshFilePath);
         if (loadSucceed) {
             assert(DIM == 3);
@@ -746,19 +842,20 @@ int main(int argc, char* argv[])
             for (int i = 0; i < (int)config.inputShapePaths.size(); ++i) {
                 componentCoDim.emplace_back(3);
 
-                const auto& inputShapePath = config.inputShapePaths[i];
+                const auto& inputShapePathStr = config.inputShapePaths[i];
+                const fs::path inputShapePath(inputShapePathStr);
                 const auto& translate = config.inputShapeTranslates[i];
                 const auto& rotate = config.inputShapeRotates[i];
                 const auto& scale = config.inputShapeScales[i];
-                int suffixI = inputShapePath.find_last_of('.');
-                if (suffixI == std::string::npos) {
-                    IPC::IglUtils::readNodeEle(inputShapePath, newV, newF, newSF);
+                if (!inputShapePath.has_extension()) {
+                    IPC::IglUtils::readNodeEle(inputShapePathStr, newV, newF, newSF);
                 }
                 else {
-                    const std::string meshFileSuffix = inputShapePath.substr(suffixI);
+                    const std::string meshFileSuffix = inputShapePath.extension().string();
+                    const std::string inputShapePathNoSuffix = inputShapePath.parent_path() / inputShapePath.stem();
                     if (meshFileSuffix == ".msh") {
-                        if (!IPC::IglUtils::readTetMesh(inputShapePath, newV, newF, newSF)) {
-                            spdlog::error("Unable to read input msh file: {:s}", inputShapePath);
+                        if (!IPC::IglUtils::readTetMesh(inputShapePathStr, newV, newF, newSF)) {
+                            spdlog::error("Unable to read input msh file: {:s}", inputShapePathStr);
                             exit(1);
                         }
                         newE.resize(0, 2);
@@ -772,8 +869,7 @@ int main(int argc, char* argv[])
                         }
                     }
                     else if (meshFileSuffix == ".ele") {
-                        std::string inputPathPre = inputShapePath.substr(0, suffixI);
-                        IPC::IglUtils::readNodeEle(inputPathPre, newV, newF, newSF);
+                        IPC::IglUtils::readNodeEle(inputShapePathNoSuffix, newV, newF, newSF);
                         newE.resize(0, 2);
 
                         if (config.inputShapeMaterials[i][0] > 0.0 && config.inputShapeMaterials[i][1] > 0.0 && config.inputShapeMaterials[i][2] > 0.0) {
@@ -787,8 +883,8 @@ int main(int argc, char* argv[])
                     else if (meshFileSuffix == ".obj") {
                         // for kinematic object
                         componentCoDim.back() = 2;
-                        if (!igl::readOBJ(inputShapePath, newV, newSF)) {
-                            spdlog::error("Unable to read input obj file: {:s}", inputShapePath);
+                        if (!igl::readOBJ(inputShapePathStr, newV, newSF)) {
+                            spdlog::error("Unable to read input obj file: {:s}", inputShapePathStr);
                             exit(-1);
                         }
                         newF.resize(0, 4);
@@ -797,10 +893,10 @@ int main(int argc, char* argv[])
                     else if (meshFileSuffix == ".seg") {
                         // for kinematic object
                         componentCoDim.back() = 1;
-                        if (!IPC::IglUtils::readSEG(inputShapePath, newV, newE)) {
+                        if (!IPC::IglUtils::readSEG(inputShapePathStr, newV, newE)) {
                             Eigen::MatrixXi tempF;
-                            if (!igl::readOBJ(inputShapePath.substr(0, suffixI) + ".obj", newV, tempF)) {
-                                spdlog::error("Unable to read input seg or obj file: {:s}", inputShapePath);
+                            if (!igl::readOBJ(inputShapePathNoSuffix + ".obj", newV, tempF)) {
+                                spdlog::error("Unable to read input seg or obj file: {:s}", inputShapePathStr);
                                 exit(1);
                             }
 
@@ -837,9 +933,9 @@ int main(int argc, char* argv[])
                         // for kinematic object
                         componentCoDim.back() = 0;
                         Eigen::MatrixXi temp;
-                        if (!igl::readOBJ(inputShapePath, newV, temp)) {
-                            if (!igl::readOBJ(inputShapePath.substr(0, suffixI) + ".obj", newV, temp)) {
-                                spdlog::error("Unable to read input pt or obj file: {:s}", inputShapePath);
+                        if (!igl::readOBJ(inputShapePathStr, newV, temp)) {
+                            if (!igl::readOBJ(inputShapePathNoSuffix + ".obj", newV, temp)) {
+                                spdlog::error("Unable to read input pt or obj file: {:s}", inputShapePathStr);
                                 exit(1);
                             }
                         }
@@ -877,24 +973,26 @@ int main(int argc, char* argv[])
                     while (DBCI < config.inputShapeDBC.size() && config.inputShapeDBC[DBCI].first == i) {
                         // vertex selection
                         std::vector<int> selectedVerts;
-                        IPC::IglUtils::Init_Dirichlet(newV, config.inputShapeDBC[DBCI].second[0],
-                            config.inputShapeDBC[DBCI].second[1], selectedVerts);
+                        const auto& inputDBC = config.inputShapeDBC[DBCI].second;
+                        IPC::IglUtils::Init_Dirichlet(newV, inputDBC.minBBox, inputDBC.maxBBox, selectedVerts);
                         for (auto& i : selectedVerts) {
                             i += V.rows();
                         }
                         if (selectedVerts.size()) {
-                            DBCInfo.emplace_back(std::pair<std::vector<int>, std::array<Eigen::Vector3d, 2>>(selectedVerts,
-                                { config.inputShapeDBC[DBCI].second[2], config.inputShapeDBC[DBCI].second[3] }));
+                            DirichletBCs.emplace_back(selectedVerts, inputDBC.linearVelocity, inputDBC.angularVelocity, inputDBC.timeRange);
                         }
                         ++DBCI;
                     }
                     while (NBCI < config.inputShapeNBC.size() && config.inputShapeNBC[NBCI].first == i) {
                         // vertex selection
                         std::vector<int> selectedVerts;
-                        IPC::IglUtils::Init_Dirichlet(newV, config.inputShapeNBC[NBCI].second[0],
-                            config.inputShapeNBC[NBCI].second[1], selectedVerts);
-                        for (const auto& vI : selectedVerts) {
-                            NBCInfo[vI + V.rows()] = config.inputShapeNBC[NBCI].second[2].template segment<DIM>(0).transpose();
+                        const auto& inputNBC = config.inputShapeNBC[NBCI].second;
+                        IPC::IglUtils::Init_Dirichlet(newV, inputNBC.minBBox, inputNBC.maxBBox, selectedVerts);
+                        for (auto& i : selectedVerts) {
+                            i += V.rows();
+                        }
+                        if (selectedVerts.size()) {
+                            NeumannBCs.emplace_back(selectedVerts, inputNBC.force, inputNBC.timeRange);
                         }
                         ++NBCI;
                     }
@@ -1025,7 +1123,7 @@ int main(int argc, char* argv[])
     // construct mesh data structure
     IPC::Mesh<DIM>* temp = new IPC::Mesh<DIM>(V, F, SF, E, UV,
         componentNodeRange, componentSFRange, componentCERange, componentCoDim,
-        componentMaterial, componentLVels, componentAVels, componentInitVels, DBCInfo, NBCInfo,
+        componentMaterial, componentLVels, componentAVels, componentInitVels, DirichletBCs, NeumannBCs,
         config.inputShapeMeshSeqFolderPath,
         config.YM, config.PR, config.rho);
     // primitive test cases
@@ -1033,6 +1131,20 @@ int main(int argc, char* argv[])
         temp->borderVerts_primitive = borderVerts_primitive;
     }
     triSoup.emplace_back(temp);
+
+    if (config.ccdMethod == ccd::CCDMethod::TIGHT_INCLUSION) {
+        // Compute a conservative error for the tight inclusion CCD
+        computeTightInclusionError(*temp, config.meshCollisionObjects);
+    }
+    else if (config.ccdMethod == ccd::CCDMethod::FLOATING_POINT_ROOT_PARITY) {
+#ifdef USE_FPRP_CCD
+        // shift entire mesh so the CCD will be exact in doubles
+        IPC::invShift = shiftVertices(*temp, config.meshCollisionObjects);
+#else
+        spdlog::error("FPRP CCD is disabled in CMake (IPC_WITH_FPRP=OFF)!");
+        exit(1);
+#endif
+    }
 
     {
         // for output surface mesh
@@ -1115,10 +1227,10 @@ int main(int argc, char* argv[])
     fs::create_directories(fs::path(outputFolderPath));
     config.backUpConfig(outputFolderPath + "/config.txt");
     for (int coI = 0; coI < config.collisionObjects.size(); ++coI) {
-        config.collisionObjects[coI]->saveMesh(outputFolderPath + "/ACO" + std::to_string(coI) + "_0.obj");
+        config.collisionObjects[coI]->saveMesh(outputFolderPath + "/ACO" + std::to_string(coI) + "_0.obj", IPC::invShift);
     }
     for (int mcoI = 0; mcoI < config.meshCollisionObjects.size(); ++mcoI) {
-        config.meshCollisionObjects[mcoI]->saveMesh(outputFolderPath + "/MCO" + std::to_string(mcoI) + "_0.obj");
+        config.meshCollisionObjects[mcoI]->saveMesh(outputFolderPath + "/MCO" + std::to_string(mcoI) + "_0.obj", IPC::invShift);
     }
 
     // create log file
@@ -1243,6 +1355,7 @@ int main(int argc, char* argv[])
         // Setup viewer and launch
         viewer.core().background_color << 1.0f, 1.0f, 1.0f, 0.0f;
         viewer.callback_key_down = &key_down;
+        viewer.callback_key_pressed = &key_pressed;
         viewer.callback_pre_draw = &preDrawFunc;
         viewer.callback_post_draw = &postDrawFunc;
         viewer.data().show_lines = true;

@@ -9,6 +9,7 @@
 #include "IglUtils.hpp"
 #include "Optimizer.hpp"
 #include "Timer.hpp"
+#include "CCDUtils.hpp"
 
 #include <igl/triangle/triangulate.h>
 #include <igl/cotmatrix.h>
@@ -50,8 +51,8 @@ Mesh<dim>::Mesh(const Eigen::MatrixXd& V_mesh,
     const std::vector<std::pair<Eigen::Vector3i, Eigen::Vector3d>>& p_componentLVels,
     const std::vector<std::pair<Eigen::Vector3i, Eigen::Vector3d>>& p_componentAVels,
     const std::vector<std::pair<Eigen::Vector3i, std::array<Eigen::Vector3d, 2>>>& p_componentInitVels,
-    const std::vector<std::pair<std::vector<int>, std::array<Eigen::Vector3d, 2>>>& p_DBCInfo,
-    const std::map<int, Eigen::Matrix<double, 1, dim>>& p_NeumannBC,
+    const std::vector<DirichletBC>& p_DirichletBCs,
+    const std::vector<NeumannBC>& p_NeumannBCs,
     const std::vector<std::pair<int, std::string>>& p_meshSeqFolderPath,
     double YM, double PR, double rho)
 {
@@ -70,8 +71,8 @@ Mesh<dim>::Mesh(const Eigen::MatrixXd& V_mesh,
     componentLVels = p_componentLVels;
     componentAVels = p_componentAVels;
     componentInitVels = p_componentInitVels;
-    DBCInfo = p_DBCInfo;
-    NeumannBC = p_NeumannBC;
+    DirichletBCs = p_DirichletBCs;
+    NeumannBCs = p_NeumannBCs;
     meshSeqFolderPath = p_meshSeqFolderPath;
     if (Vt_mesh.rows() == V_mesh.rows()) {
         V = Vt_mesh;
@@ -412,14 +413,14 @@ void Mesh<dim>::computeMassMatrix(const igl::MassMatrixType type)
 }
 
 template <int dim>
-void Mesh<dim>::computeFeatures(bool multiComp, bool resetFixedV)
+void Mesh<dim>::computeFeatures(bool multiComp, bool resetDBCV)
 {
-    if (resetFixedV) {
-        fixedVert.clear();
-        fixedVert.insert(0);
-        isFixedVert.resize(0);
-        isFixedVert.resize(V.rows(), false);
-        isFixedVert[0] = true;
+    if (resetDBCV) {
+        DBCVertexIds.clear();
+        DBCVertexIds.insert(0);
+        vertexDBCType.clear();
+        vertexDBCType.resize(V.rows(), DirichletBCType::NOT_DBC);
+        vertexDBCType[0] = DirichletBCType::NOT_DBC;
     }
 
     restTriInv.resize(F.rows());
@@ -538,41 +539,55 @@ void Mesh<dim>::computeFeatures(bool multiComp, bool resetFixedV)
 }
 
 template <int dim>
-void Mesh<dim>::resetFixedVert(const std::set<int>& p_fixedVert)
+void Mesh<dim>::resetDBCVertices(const std::map<int, DirichletBCType>& p_DBCVert)
 {
-    isFixedVert.resize(0);
-    isFixedVert.resize(V.rows(), false);
-    for (const auto& vI : p_fixedVert) {
+    DBCVertexIds.clear();
+    vertexDBCType.clear();
+    vertexDBCType.resize(V.rows(), DirichletBCType::NOT_DBC);
+    for (const auto& [vI, type] : p_DBCVert) {
         assert(vI < V.rows());
-        isFixedVert[vI] = true;
+        vertexDBCType[vI] = type;
+        if (type != DirichletBCType::NOT_DBC) {
+            DBCVertexIds.insert(vI);
+        }
     }
-
-    fixedVert = p_fixedVert;
 }
+
 template <int dim>
-void Mesh<dim>::addFixedVert(int vI)
+void Mesh<dim>::addDBCVertex(int vI, DirichletBCType type)
 {
     assert(vI < V.rows());
-    fixedVert.insert(vI);
-    isFixedVert[vI] = true;
-}
-template <int dim>
-void Mesh<dim>::addFixedVert(const std::vector<int>& p_fixedVert)
-{
-    for (const auto& vI : p_fixedVert) {
-        assert(vI < V.rows());
-        isFixedVert[vI] = true;
+    vertexDBCType[vI] = type;
+    if (type == DirichletBCType::NOT_DBC) {
+        DBCVertexIds.erase(vI);
     }
-
-    fixedVert.insert(p_fixedVert.begin(), p_fixedVert.end());
+    else {
+        DBCVertexIds.insert(vI);
+    }
 }
 
 template <int dim>
-void Mesh<dim>::removeFixedVert(int vI)
+void Mesh<dim>::addDBCVertices(const std::vector<std::pair<int, DirichletBCType>>& p_DBCVert)
+{
+    for (const auto& [vI, type] : p_DBCVert) {
+        addDBCVertex(vI, type);
+    }
+}
+
+template <int dim>
+void Mesh<dim>::addDBCVertices(const std::vector<int>& p_DBCVert, DirichletBCType type)
+{
+    for (const auto& vI : p_DBCVert) {
+        addDBCVertex(vI, type);
+    }
+}
+
+template <int dim>
+void Mesh<dim>::removeDBCVertex(int vI)
 {
     assert(vI < V.rows());
-    fixedVert.erase(vI);
-    isFixedVert[vI] = false;
+    DBCVertexIds.erase(vI);
+    vertexDBCType[vI] = DirichletBCType::NOT_DBC;
 }
 
 template <int dim>
@@ -615,8 +630,8 @@ double Mesh<dim>::matSpaceBBoxSize2(int coDim) const
         assert(coDim >= 0 && coDim <= 3);
 
         Eigen::Array<double, 1, dim> bottomLeft, topRight;
-        bottomLeft = __DBL_MAX__;
-        topRight = -__DBL_MAX__;
+        bottomLeft = std::numeric_limits<double>::infinity();
+        topRight = -std::numeric_limits<double>::infinity();
         for (int compI = 0; compI < componentCoDim.size(); ++compI) {
             if (componentCoDim[compI] == coDim) {
                 bottomLeft = bottomLeft.min(V_rest.block(componentNodeRange[compI], 0, componentNodeRange[compI + 1] - componentNodeRange[compI], dim).colwise().minCoeff().array());
@@ -811,14 +826,19 @@ void Mesh<dim>::saveAsMesh(const std::string& filePath, bool scaleUV,
 }
 
 template <int dim>
-void Mesh<dim>::saveSurfaceMesh(const std::string& filePath) const
+void Mesh<dim>::saveSurfaceMesh(const std::string& filePath, bool use_V_prev, bool useInvShift) const
 {
     if constexpr (dim == 3) {
         Eigen::MatrixXd V_surf(SVI.size(), 3);
         std::unordered_map<int, int> vI2SVI;
         for (int svI = 0; svI < SVI.size(); ++svI) {
             vI2SVI[SVI[svI]] = svI;
-            V_surf.row(svI) = V.row(SVI[svI]);
+            if (use_V_prev) {
+                V_surf.row(svI) = V_prev.row(SVI[svI]);
+            }
+            else {
+                V_surf.row(svI) = V.row(SVI[svI]);
+            }
         }
 
         Eigen::MatrixXi F_surf(SF.rows(), 3);
@@ -828,6 +848,9 @@ void Mesh<dim>::saveSurfaceMesh(const std::string& filePath) const
             F_surf(sfI, 2) = vI2SVI[SF(sfI, 2)];
         }
 
+        if (useInvShift) {
+            V_surf.rowwise() += invShift.transpose();
+        }
         igl::writeOBJ(filePath, V_surf, F_surf);
     }
     else {
@@ -840,10 +863,24 @@ void Mesh<dim>::saveBCNodes(const std::string& filePath) const
 {
     FILE* out = fopen(filePath.c_str(), "w");
     assert(out);
-    for (const auto& fixedVI : fixedVert) {
-        fprintf(out, "%d\n", fixedVI);
+    for (const auto& vI : DBCVertexIds) {
+        fprintf(out, "%d\n", vI);
     }
-    for (const auto& NMI : NeumannBC) {
+
+    std::map<int, Eigen::Vector3d> vertexToNBC;
+    for (const auto NBC : NeumannBCs) {
+        for (const auto& vI : NBC.vertIds) {
+            auto loc = vertexToNBC.find(vI);
+            if (loc == vertexToNBC.end()) {
+                vertexToNBC[vI] = NBC.force;
+            }
+            else {
+                loc->second += NBC.force;
+            }
+        }
+    }
+
+    for (const auto& NMI : vertexToNBC) {
         fprintf(out, "%d %le %le", NMI.first, NMI.second[0], NMI.second[1]);
         if constexpr (dim == 2) {
             fprintf(out, "\n");
